@@ -1,0 +1,6 @@
+# SwiftPM build output and Xcode state: never part of the package.
+.build/
+.swiftpm/
+*.xcodeproj/xcuserdata/
+# A library does not pin its dependencies for the apps that use it.
+Package.resolved
