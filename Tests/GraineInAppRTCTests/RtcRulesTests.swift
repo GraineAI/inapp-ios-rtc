@@ -54,7 +54,7 @@ import Testing
         #expect(DialRules.heardDeadline(registerSeconds: 2.1) == 4.2)
         #expect(DialRules.heardDeadline(registerSeconds: 9) == 8)
         #expect(DialRules.answerDeadline == 15)
-        #expect(DialRules.answerAfterHeard == 3)
+        #expect(DialRules.answerAfterHeard == 0.5, "a seatbelt: ~13x the 37 ms median answer, never 0.10.2's 3 s")
         // Two stuck dials, each with a second of setup, inside the attempt's 12 s: the redial must be reachable.
         #expect(Double(DialRules.maxDials) * (DialRules.answerAfterHeard + 1) < 12)
         #expect(DialRules.iceConnectDeadline == 8)

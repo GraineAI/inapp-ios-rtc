@@ -222,7 +222,7 @@ final class EngineRig {
         rig.ready()
         rig.engine.audioActivated()
         #expect(rig.invites.count == 1)
-        rig.clock.advance(2.9)
+        rig.clock.advance(0.4)
         #expect(rig.sockets.sip.count == 1, "heard: still waiting for the answer")
         rig.clock.advance(0.2)
         #expect(rig.sbc.received.contains { $0.method == "CANCEL" }, "the stuck INVITE is cancelled, not left on the server")
@@ -241,11 +241,11 @@ final class EngineRig {
         rig.sbc.inviteFinal = nil
         rig.ready()
         rig.engine.audioActivated()
-        rig.clock.advance(3.1)
+        rig.clock.advance(0.6)
         #expect(rig.sockets.sip.count == 2)
         rig.openSip()
-        rig.clock.advance(2.9)
-        #expect(rig.names == ["ready"], "the second dial gets its own 3 s")
+        rig.clock.advance(0.4)
+        #expect(rig.names == ["ready"], "the second dial gets its own half second")
         rig.clock.advance(0.2)
         #expect(rig.names == ["ready", "unreachable(no_answer)"])
     }
