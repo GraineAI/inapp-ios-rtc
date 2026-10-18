@@ -363,7 +363,17 @@ final class RtcCallEngine: GraineRtcCall {
 
         case .heard(let code):
             guard phase == .dialing else { return }
-            if !heard { mark("heard") }
+            if !heard {
+                mark("heard")
+                // The SBC has it: still only "trying" after DialRules.answerAfterHeard is a stuck dial, cancelled
+                // and dialled once more on a fresh connection while the attempt's budget still has room.
+                let seq = dialSeq
+                answerTimer?.cancel()
+                answerTimer = clock.after(DialRules.answerAfterHeard) { [weak self] in
+                    guard let self = self, seq == self.dialSeq, self.phase == .dialing else { return }
+                    self.dialFailed(cause: "no_answer", code: nil)
+                }
+            }
             heard = true
             heardTimer?.cancel()
             trace("dial: \(code)")

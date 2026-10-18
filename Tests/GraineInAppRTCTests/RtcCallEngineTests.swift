@@ -214,18 +214,39 @@ final class EngineRig {
         #expect(rig.names == ["ready", "unreachable(no_response)"])
     }
 
-    @Test func noAnswerWithin15Seconds() {
+    /// 16 Oct: the SBC said "trying" and the call never reached the agent, every other tap.
+    @Test func aStuckDialIsCancelledAndDialledAgainInsideTheBudgetAndConnects() {
+        let rig = EngineRig()                      // the real 12 s budget
+        rig.sbc.challenge = false
+        rig.sbc.inviteFinal = nil                  // 100 Trying, then nothing
+        rig.ready()
+        rig.engine.audioActivated()
+        #expect(rig.invites.count == 1)
+        rig.clock.advance(2.9)
+        #expect(rig.sockets.sip.count == 1, "heard: still waiting for the answer")
+        rig.clock.advance(0.2)
+        #expect(rig.sbc.received.contains { $0.method == "CANCEL" }, "the stuck INVITE is cancelled, not left on the server")
+        #expect(rig.sockets.sip.count == 2, "a fresh connection")
+        #expect(rig.minting.requests.count == 1, "on the same credential")
+        rig.sbc.inviteFinal = 200                  // this dial gets through
+        rig.openSip()
+        #expect(rig.invites.count == 2, "dialled again")
+        rig.media.ice(.connected)
+        #expect(rig.names == ["ready", "connected"])
+    }
+
+    @Test func heardButNeverAnsweredTwiceFallsBackWithNoAnswer() {
         let rig = EngineRig(budget: 60)
         rig.sbc.challenge = false
         rig.sbc.inviteFinal = nil
         rig.ready()
         rig.engine.audioActivated()
-        rig.clock.advance(14.9)
-        #expect(rig.sockets.sip.count == 1, "100 Trying arrived: still waiting")
-        rig.clock.advance(0.2)
+        rig.clock.advance(3.1)
         #expect(rig.sockets.sip.count == 2)
         rig.openSip()
-        rig.clock.advance(15.1)
+        rig.clock.advance(2.9)
+        #expect(rig.names == ["ready"], "the second dial gets its own 3 s")
+        rig.clock.advance(0.2)
         #expect(rig.names == ["ready", "unreachable(no_answer)"])
     }
 

@@ -54,6 +54,9 @@ import Testing
         #expect(DialRules.heardDeadline(registerSeconds: 2.1) == 4.2)
         #expect(DialRules.heardDeadline(registerSeconds: 9) == 8)
         #expect(DialRules.answerDeadline == 15)
+        #expect(DialRules.answerAfterHeard == 3)
+        // Two stuck dials, each with a second of setup, inside the attempt's 12 s: the redial must be reachable.
+        #expect(Double(DialRules.maxDials) * (DialRules.answerAfterHeard + 1) < 12)
         #expect(DialRules.iceConnectDeadline == 8)
         #expect(DialRules.registerDeadline == 15)
     }
