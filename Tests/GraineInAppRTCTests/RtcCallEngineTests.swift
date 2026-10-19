@@ -90,6 +90,8 @@ final class EngineRig {
             case .ready: return "ready"
             case .connected: return "connected"
             case .speaking(let on): return "speaking(\(on))"
+            case .reconnecting(let on): return "reconnecting(\(on))"
+            case .level: return nil
             case .control: return "control"
             case let .unreachable(reason, _): return "unreachable(\(reason.rawValue))"
             case let .refused(code, _): return "refused(\(code))"
@@ -102,6 +104,22 @@ final class EngineRig {
 
     var lines: [String] {
         events.compactMap { if case .log(let line) = $0 { return line }; return nil }
+    }
+
+    var levels: [Double] {
+        events.compactMap { if case .level(let value) = $0 { return value }; return nil }
+    }
+
+    var reconnecting: [String] { names.filter { $0.hasPrefix("reconnecting") } }
+
+    /// Their BYE for the call's dialog.
+    func theirBye() {
+        guard let invite = invites.last else { return }
+        sockets.sip.last?.deliver([
+            "BYE sip:c@h.invalid SIP/2.0", "Via: SIP/2.0/WSS 198.51.100.7;branch=z9hG4bKbye",
+            "From: <sip:app-1@sbc.example.test>;tag=cByBmmry4gpBj", "To: \(invite.header("From")!)",
+            "Call-ID: \(invite.callId!)", "CSeq: 1 BYE", "Content-Length: 0", "", "",
+        ].joined(separator: "\r\n"))
     }
 }
 
@@ -424,6 +442,103 @@ final class EngineRig {
         #expect(!rig.names.contains("speaking(false)"))
         rig.clock.advance(0.5)
         #expect(rig.names.contains("speaking(false)"), "quiet for half a second")
+    }
+
+    // MARK: Reconnecting (the call screen's moment) and the agent's level
+
+    @Test func aLostPathIsReconnectingUntilItIsBack() {
+        let rig = EngineRig()
+        rig.live()
+        #expect(rig.reconnecting.isEmpty)
+        rig.media.ice(.disconnected)
+        #expect(rig.reconnecting == ["reconnecting(true)"], "at once: the screen says so while the path is away")
+        rig.clock.advance(3.1)
+        #expect(rig.media.reoffers == [true])
+        #expect(rig.reconnecting == ["reconnecting(true)"], "the restart is the same moment, said once")
+        rig.media.ice(.checking)
+        #expect(rig.reconnecting == ["reconnecting(true)"])
+        rig.media.ice(.connected)
+        #expect(rig.reconnecting == ["reconnecting(true)", "reconnecting(false)"], "back")
+        rig.clock.advance(20)
+        #expect(!rig.names.contains("ended(dropped)"))
+    }
+
+    @Test func aPathBackOnItsOwnEndsTheMomentToo() {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.ice(.disconnected)
+        rig.clock.advance(1)
+        rig.media.ice(.completed)
+        #expect(rig.reconnecting == ["reconnecting(true)", "reconnecting(false)"])
+        #expect(rig.media.reoffers.isEmpty, "back before the restart was due")
+    }
+
+    @Test func aFailedPathIsReconnectingAsItRestarts() {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.ice(.failed)
+        #expect(rig.media.reoffers == [true])
+        #expect(rig.reconnecting == ["reconnecting(true)"])
+    }
+
+    @Test func neverReconnectingBeforeTheMedia() {
+        // Answered, the path lost before it ever connected: a fallback to the socket, never a reconnect.
+        let failed = EngineRig()
+        failed.ready()
+        failed.engine.audioActivated()
+        failed.media.ice(.checking)
+        failed.media.ice(.failed)
+        #expect(failed.names == ["ready", "unreachable(ice_timeout)"])
+        #expect(failed.reconnecting.isEmpty)
+        let lost = EngineRig()
+        lost.ready()
+        lost.engine.audioActivated()
+        lost.media.ice(.disconnected)
+        lost.clock.advance(13)
+        #expect(lost.reconnecting.isEmpty)
+        #expect(lost.names.last?.hasPrefix("unreachable") == true)
+        #expect(lost.levels.isEmpty, "no level before the media")
+    }
+
+    @Test func theEndClearsReconnecting() {
+        let dropped = EngineRig()
+        dropped.live()
+        dropped.media.ice(.disconnected)
+        dropped.clock.advance(10.1)
+        #expect(Array(dropped.names.suffix(2)) == ["reconnecting(false)", "ended(dropped)"], "false before the end")
+        let remote = EngineRig()
+        remote.live()
+        remote.media.ice(.disconnected)
+        remote.theirBye()
+        #expect(Array(remote.names.suffix(2)) == ["reconnecting(false)", "ended(remote)"])
+        // A call that ends while connected says nothing about reconnecting at all.
+        let plain = EngineRig()
+        plain.live()
+        plain.theirBye()
+        #expect(plain.reconnecting.isEmpty)
+        #expect(plain.names.last == "ended(remote)")
+    }
+
+    @Test func theAgentsLevelIsReportedFiveTimesASecondWhileLive() {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.level.audioLevel = 0.3
+        rig.media.level.packetsReceived = 40
+        rig.clock.advance(1.0)
+        #expect(rig.levels == [0.3, 0.3, 0.3, 0.3, 0.3], "what the receiver plays, every 200 ms")
+        rig.media.level.audioLevel = 0
+        rig.clock.advance(0.2)
+        #expect(rig.levels.last == 0, "silence is a level too")
+        rig.media.level.audioLevel = 1.7
+        rig.clock.advance(0.2)
+        #expect(rig.levels.last == 1, "never past full scale")
+        rig.media.level.audioLevel = .nan
+        rig.clock.advance(0.2)
+        #expect(rig.levels.last == 0, "a reading that is not a number is silence")
+        let count = rig.levels.count
+        rig.theirBye()
+        rig.clock.advance(2)
+        #expect(rig.levels.count == count, "none after the end")
     }
 
     @Test func controlFramesQueueThenFlow() {

@@ -23,7 +23,9 @@ import Foundation
  *             fresh connection, anything else goes to the WebSocket
  *   live      the media watched: a path lost for 3 s is restarted once (a
  *             re-INVITE with new ICE credentials); not back within 10 s, or
- *             lost for 8 s with no restart possible, and the call has dropped
+ *             lost for 8 s with no restart possible, and the call has dropped.
+ *             While it is lost the call is `reconnecting` (the call screen's
+ *             moment); the receiver's level is reported five times a second
  *
  * Before any media: every failure is `unreachable` with the voice bar's
  * reason, and the SDK carries the call on the WebSocket inside the same
@@ -138,6 +140,8 @@ final class RtcCallEngine: GraineRtcCall {
     private var restartTried = false
     private var levelTimer: RtcTimer?
     private var speaking = false
+    /// The live path was lost and is being brought back: what the call screen shows as "Reconnecting".
+    private var reconnecting = false
     private var quietSince: Double?
     /// Times of each step, for the log and the live test.
     private(set) var marks: [String: Double] = [:]
@@ -680,11 +684,22 @@ final class RtcCallEngine: GraineRtcCall {
             dropBegan = nil
             for timer in dropTimers { timer.cancel() }
             dropTimers = []
+            setReconnecting(false)
         case .disconnected, .failed:
+            // Only here, with the media up before: a path that never connected is a fallback, never a reconnect.
+            setReconnecting(true)
             mediaLost(failed: state == .failed)
         default:
             break
         }
+    }
+
+    /// Reconnecting, said once each way.
+    private func setReconnecting(_ value: Bool) {
+        guard reconnecting != value else { return }
+        reconnecting = value
+        trace(value ? "media: reconnecting" : "media: reconnected")
+        emit(.reconnecting(value))
     }
 
     private func goLive() {
@@ -730,6 +745,7 @@ final class RtcCallEngine: GraineRtcCall {
         guard !restartTried, phase == .live, let media = media, let ua = ua else { return }
         restartTried = true
         restartedAt = clock.now
+        setReconnecting(true)
         trace("media: restarting ICE")
         media.reoffer(iceRestart: true) { [weak self] result in
             guard let self = self, self.phase == .live else { return }
@@ -773,6 +789,8 @@ final class RtcCallEngine: GraineRtcCall {
     private func heardLevel(_ stats: RtcInboundAudio) {
         if stats.packetsReceived > 0, marks["first_packet"] == nil { mark("first_packet") }
         quality.add(stats)
+        // The agent's voice as the receiver plays it out, for the call screen's visualiser (smoothed by the SDK).
+        emit(.level(stats.audioLevel.isFinite ? max(0, min(1, stats.audioLevel)) : 0))
         if stats.audioLevel >= Self.speakingLevel {
             if marks["first_voice"] == nil {
                 mark("first_voice")
@@ -822,6 +840,8 @@ final class RtcCallEngine: GraineRtcCall {
             speaking = false
             emit(.speaking(false))
         }
+        // A call that ends while reconnecting is reconnecting no more.
+        setReconnecting(false)
         emit(.ended(ending))
     }
 
