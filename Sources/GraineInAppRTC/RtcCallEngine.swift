@@ -6,8 +6,10 @@ import Foundation
  * process, under CallKit.
  *
  *   prepare   a session id; the call session minted (with the same identity
- *             and variables the call's ticket carries); then, side by side,
- *             the peer gathering its candidates and the SIP socket registering
+ *             and variables the call's ticket carries) — at the telephony
+ *             gateway with a grant asked for exactly this call when one is in
+ *             hand, else on the web route; then, side by side, the peer
+ *             gathering its candidates and the SIP socket registering
  *   begin     the control channel opens (the server holds it until the call
  *             exists) and the attempt's budget starts: 12 s to media, or the
  *             call is the WebSocket's
@@ -37,6 +39,8 @@ final class RtcCallEngine: GraineRtcCall {
         var makeMedia: (RtcClock) -> RtcMedia
         var audio: RtcAudioControl
         var now: () -> Date = Date.init
+        /// The credential from the telephony gateway, with a grant (Engine/RtcDirectMint.swift); nil: the web route only.
+        var direct: RtcDirectMint? = nil
 
         static func production() -> Parts {
             #if os(iOS)
@@ -50,7 +54,8 @@ final class RtcCallEngine: GraineRtcCall {
                 minting: URLSessionRtcMinting(),
                 random: SystemSipRandom(),
                 makeMedia: { WebRTCMedia(clock: $0) },
-                audio: audio
+                audio: audio,
+                direct: RtcDirectMint.shared
             )
         }
     }
@@ -83,11 +88,30 @@ final class RtcCallEngine: GraineRtcCall {
     private var sink: ((GraineRtcEvent) -> Void)?
     private var held: [GraineRtcEvent] = []
     private var silenced = false
+    /// Who hears, while the call is prepared ahead of its dial, that it is ready or lost (`onPrepared`).
+    private var preparedSink: ((GraineRtcPreparedState) -> Void)?
 
     // Everything below is touched on the clock only.
     private var phase = Phase.idle
     private var control: RtcControlChannel?
     private var credential: RtcCredential?
+    /// The credential came from the telephony gateway (for the prepared report).
+    private var mintedDirect = false
+    /// The audio gate was taken (`callBegins`): released exactly once, by the leg that took it.
+    private var audioTaken = false
+    /// Prepared ahead of the tap, and the transport row to send at media — said by the call that dials it; under `sinkLock`.
+    private var aheadOfTap = false
+    private var openingRow: String?
+    // For the analytics rows (GraineCallTelemetry): ready when it was begun, the last INVITE, the first
+    // registration, a heal under way, the media's numbers.
+    private var readyAtTap = false
+    private var lastInviteAt: Double?
+    private var firstRegisterMs: Double?
+    private var healing: (what: String, since: Double)?
+    private var sipLostAt: Double?
+    private var restartedAt: Double?
+    private var qualitySent = false
+    private var quality = RtcQualitySamples()
     private var media: RtcMedia?
     private var offer: String?
     private var ua: SipUserAgent?
@@ -142,6 +166,45 @@ final class RtcCallEngine: GraineRtcCall {
         }
     }
 
+    var onPrepared: ((GraineRtcPreparedState) -> Void)? {
+        get {
+            sinkLock.lock()
+            defer { sinkLock.unlock() }
+            return preparedSink
+        }
+        set {
+            sinkLock.lock()
+            preparedSink = newValue
+            sinkLock.unlock()
+        }
+    }
+
+    var preparedAhead: Bool {
+        get {
+            sinkLock.lock()
+            defer { sinkLock.unlock() }
+            return aheadOfTap
+        }
+        set {
+            sinkLock.lock()
+            aheadOfTap = newValue
+            sinkLock.unlock()
+        }
+    }
+
+    var transportRow: String? {
+        get {
+            sinkLock.lock()
+            defer { sinkLock.unlock() }
+            return openingRow
+        }
+        set {
+            sinkLock.lock()
+            openingRow = newValue
+            sinkLock.unlock()
+        }
+    }
+
     func prepare() {
         clock.run { [self] in
             guard phase == .idle else { return }
@@ -149,6 +212,7 @@ final class RtcCallEngine: GraineRtcCall {
             startedAt = clock.now
             // Nothing touches the microphone until CallKit hands the audio over.
             parts.audio.callBegins()
+            audioTaken = true
             let channel = RtcControlChannel(host: request.controlHost, sessionId: sessionId, clock: clock, sockets: parts.sockets, log: { [weak self] in self?.trace($0) })
             channel.onFrame = { [weak self] text in self?.emit(.control(text)) }
             channel.onJoined = { [weak self] joined in
@@ -165,6 +229,8 @@ final class RtcCallEngine: GraineRtcCall {
             guard !begun, phase != .ended else { return }
             begun = true
             mark("begin")
+            // Set up and registered before the tap — a prepared call's connect row says so.
+            readyAtTap = phase == .ready && !redialing
             control?.open()
             budgetTimer = clock.after(request.budgetSeconds) { [weak self] in self?.budgetSpent() }
             dialIfReady()
@@ -218,6 +284,8 @@ final class RtcCallEngine: GraineRtcCall {
     func hangUp() {
         clock.run { [self] in
             guard phase != .ended else { return }
+            // The call's quality row goes before the BYE, on the channel still open; best effort, never waited for.
+            if phase == .live { sendQualityRow() }
             // Nothing is reported after a hang-up, not even to the log: the caller has moved on.
             silence()
             release(sendBye: true)
@@ -226,6 +294,14 @@ final class RtcCallEngine: GraineRtcCall {
 
     // MARK: - The call session
 
+    /**
+     * THE GATEWAY FIRST, THE WEB ROUTE SECOND — the voice bar's order. A call
+     * holding a grant asked for exactly it (its agent, its customer, its id)
+     * takes it straight to the telephony gateway; the answer is the
+     * credential, a gate's refusal, or "the web route", which is then asked as
+     * before. Each failure of the direct mint costs one short request and
+     * nothing else.
+     */
     private func mint() {
         var base = request.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") { base.removeLast() }
@@ -233,25 +309,59 @@ final class RtcCallEngine: GraineRtcCall {
             return giveUp(.mintFailed, "the base URL is not a URL")
         }
         mark("mint_sent")
-        parts.minting.mint(url, body: request.mintBody(sessionId)) { [weak self] outcome in
-            self?.clock.run { self?.minted(outcome) }
+        let body = request.mintBody(sessionId)
+        guard let direct = parts.direct else {
+            return mintOnWebRoute(url, base: base, body: body)
+        }
+        direct.mint(baseUrl: base, body: body) { [weak self] answer in
+            self?.clock.run {
+                guard let self = self, self.phase == .preparing || self.redialing else { return }
+                switch answer {
+                case .minted(let outcome):
+                    self.minted(outcome, at: "the gateway")
+                case .webRoute(let why):
+                    self.trace("direct mint: \(why) — minting on the web route")
+                    self.mintOnWebRoute(url, base: base, body: body)
+                }
+            }
         }
     }
 
-    private func minted(_ outcome: RtcMintOutcome) {
+    /// `POST {baseUrl}/api/embed/rtc-session`: every check on the way, and a grant back beside the credential.
+    private func mintOnWebRoute(_ url: URL, base: String, body: Data) {
+        parts.minting.mint(url, body: body) { [weak self] outcome in
+            self?.clock.run {
+                guard let self = self else { return }
+                if case .credential(let credential) = outcome {
+                    if let offer = credential.direct {
+                        // The grant beside the credential is this call's own: a redial's mint takes it to the gateway.
+                        self.parts.direct?.accept(offer, baseUrl: base, body: body)
+                    } else if self.request.rang {
+                        // A call that rang, and its answer brought no grant: one asked for on its own, for a later mint of it.
+                        self.parts.direct?.warm(baseUrl: base, body: body)
+                    }
+                }
+                self.minted(outcome, at: nil)
+            }
+        }
+    }
+
+    private func minted(_ outcome: RtcMintOutcome, at place: String?) {
         guard phase == .preparing || redialing else { return }
         if case let .refused(_, code?, message) = outcome, GraineRtcRefusal.codes.contains(code) {
             // A gate said no to the call itself: it ends here, in the gate's words — no fallback.
             trace("refused by the call session: \(code)")
             release(sendBye: false)
             emit(.refused(code: code, message: message ?? ""))
+            notePrepared(.lost)
             return
         }
         guard case .credential(let credential) = outcome else {
             return giveUp(.mintFailed, outcome.detail)
         }
+        mintedDirect = place != nil
         mark("minted")
-        trace("minted in \(ms(since: "mint_sent")) ms (\(credential.iceServers.count) ICE server(s))")
+        trace("minted\(place.map { " at \($0)" } ?? "") in \(ms(since: "mint_sent")) ms (\(credential.iceServers.count) ICE server(s))")
         self.credential = credential
         if media == nil { startMedia(credential) }
         connectSip(credential)
@@ -319,6 +429,11 @@ final class RtcCallEngine: GraineRtcCall {
         switch event {
         case .connected:
             mark("sip_open")
+            // The SIP socket came back under an answered call: replaced.
+            if let lost = sipLostAt, phase >= .answered {
+                sipLostAt = nil
+                sendRecoveryRow("socket_replaced", since: lost)
+            }
 
         case .registered(let seconds):
             registered = true
@@ -327,6 +442,11 @@ final class RtcCallEngine: GraineRtcCall {
             mark("registered")
             trace("registered in \(Int(seconds * 1000)) ms")
             redialing = false
+            if firstRegisterMs == nil { firstRegisterMs = seconds * 1000 }
+            if let heal = healing, heal.what == "socket_replaced" {
+                healing = nil
+                sendRecoveryRow("socket_replaced", since: heal.since)
+            }
             // A fresh connection made before the offer was ready waits for it like the first one did.
             if phase == .preparing {
                 becomeReady()
@@ -341,12 +461,18 @@ final class RtcCallEngine: GraineRtcCall {
 
         case .transportLost(let detail):
             trace("sip: socket lost (\(detail))")
+            // A call prepared ahead whose socket dropped is let go by whoever prepared it; the tap prepares afresh.
+            if !begun, phase == .preparing || phase == .ready { notePrepared(.lost) }
             switch phase {
             case .preparing, .ready:
                 // Before the dial: one fresh connection, as a dead warm socket gets one in the voice bar.
+                if healing == nil { healing = ("socket_replaced", clock.now) }
                 freshConnection(after: "the SIP socket closed (\(detail))", fallback: .registerFailed)
             case .answered:
                 ua?.keepsTransport = true
+                sipLostAt = sipLostAt ?? clock.now
+            case .live:
+                sipLostAt = sipLostAt ?? clock.now
             default:
                 break
             }
@@ -355,6 +481,7 @@ final class RtcCallEngine: GraineRtcCall {
             guard phase == .dialing, !heardArmed else { return }
             heardArmed = true
             mark("invite")
+            lastInviteAt = clock.now
             let seq = dialSeq
             heardTimer = clock.after(DialRules.heardDeadline(registerSeconds: registerSeconds)) { [weak self] in
                 guard let self = self, seq == self.dialSeq, self.phase == .dialing, !self.heard else { return }
@@ -389,7 +516,7 @@ final class RtcCallEngine: GraineRtcCall {
             ua?.keepsTransport = true
             iceTimer = clock.after(DialRules.iceConnectDeadline) { [weak self] in
                 guard let self = self, self.phase == .answered else { return }
-                self.giveUp(.iceTimeout, "the media path did not connect within \(Int(DialRules.iceConnectDeadline)) s of the answer")
+                self.giveUp(.iceTimeout, "the media path did not connect within \(Int(DialRules.iceConnectDeadline)) s of the answer", media: "ice_timeout")
             }
             media.applyAnswer(sdp) { [weak self] error in
                 guard let self = self, self.phase == .answered else { return }
@@ -446,6 +573,7 @@ final class RtcCallEngine: GraineRtcCall {
         mark("ready")
         trace("ready in \(ms(since: nil)) ms")
         emit(.ready)
+        notePrepared(.ready(milliseconds: ms(since: nil), direct: mintedDirect))
         dialIfReady()
     }
 
@@ -484,6 +612,7 @@ final class RtcCallEngine: GraineRtcCall {
         case .redial:
             trace("dial: \(why) — dialling once more on a fresh connection")
             mark("redial")
+            healing = ("redial", clock.now)
             dialSeq += 1
             phase = .ready
             freshConnection(after: why, fallback: Self.reason(cause: cause))
@@ -520,7 +649,7 @@ final class RtcCallEngine: GraineRtcCall {
         case .answered: reason = .iceTimeout
         default: reason = .error
         }
-        giveUp(reason, "WebRTC did not connect within \(Int(request.budgetSeconds)) s")
+        giveUp(reason, "WebRTC did not connect within \(Int(request.budgetSeconds)) s", media: phase == .answered ? "ice_timeout" : nil)
     }
 
     // MARK: - Media
@@ -533,7 +662,7 @@ final class RtcCallEngine: GraineRtcCall {
             case .connected, .completed:
                 goLive()
             case .failed:
-                giveUp(.iceTimeout, "the media path failed before it connected")
+                giveUp(.iceTimeout, "the media path failed before it connected", media: "ice_failed")
             default:
                 break
             }
@@ -542,7 +671,12 @@ final class RtcCallEngine: GraineRtcCall {
         guard phase == .live else { return }
         switch state {
         case .connected, .completed:
-            if dropBegan != nil { trace("media: back after \(Int((clock.now - (dropBegan ?? clock.now)) * 1000)) ms") }
+            if let began = dropBegan {
+                trace("media: back after \(Int((clock.now - began) * 1000)) ms")
+                // Healed by the restart it was given (back on its own, it is no recovery of ours).
+                if restartedAt != nil { sendRecoveryRow("ice_restart", since: began) }
+            }
+            restartedAt = nil
             dropBegan = nil
             for timer in dropTimers { timer.cancel() }
             dropTimers = []
@@ -561,6 +695,11 @@ final class RtcCallEngine: GraineRtcCall {
         mark("connected")
         trace("connected: media \(ms(since: "answered")) ms after the answer, \(ms(since: nil)) ms after the start")
         emit(.connected)
+        sendConnectRow()
+        if let heal = healing, heal.what == "redial" {
+            healing = nil
+            sendRecoveryRow("redial", since: heal.since)
+        }
         pollLevel()
     }
 
@@ -590,6 +729,7 @@ final class RtcCallEngine: GraineRtcCall {
     private func restartIce() {
         guard !restartTried, phase == .live, let media = media, let ua = ua else { return }
         restartTried = true
+        restartedAt = clock.now
         trace("media: restarting ICE")
         media.reoffer(iceRestart: true) { [weak self] result in
             guard let self = self, self.phase == .live else { return }
@@ -632,10 +772,12 @@ final class RtcCallEngine: GraineRtcCall {
 
     private func heardLevel(_ stats: RtcInboundAudio) {
         if stats.packetsReceived > 0, marks["first_packet"] == nil { mark("first_packet") }
+        quality.add(stats)
         if stats.audioLevel >= Self.speakingLevel {
             if marks["first_voice"] == nil {
                 mark("first_voice")
                 trace("first agent audio \(ms(since: "answered")) ms after the answer (\(stats.codec ?? "codec unknown"))")
+                sendVoiceRow(stats)
             }
             quietSince = nil
             if !speaking {
@@ -655,18 +797,26 @@ final class RtcCallEngine: GraineRtcCall {
 
     // MARK: - Endings
 
-    /// Before any media: release everything and hand the call to the WebSocket.
-    private func giveUp(_ reason: GraineRtcFallback, _ detail: String) {
+    /**
+     * Before any media: release everything and hand the call to the WebSocket.
+     * `media`: answered, and no audio path — the call's media row says why, on
+     * its own channel before it closes (best effort).
+     */
+    private func giveUp(_ reason: GraineRtcFallback, _ detail: String, media: String? = nil) {
         guard phase != .ended, phase != .live else { return }
         trace("giving up (\(reason.rawValue)): \(detail)")
+        if let why = media, phase == .answered { sendRow("media", ["reason": why, "transport": "rtc"]) }
         release(sendBye: true)
         emit(.unreachable(reason, detail: detail))
+        notePrepared(.lost)
     }
 
     /// After media: the call is over.
     private func end(_ ending: GraineRtcEnding) {
         guard phase == .live else { return }
         if case .dropped(let why) = ending { trace("dropped: \(why)") }
+        // Their BYE (or the path lost): the quality row at once, while the channel may still be open.
+        sendQualityRow()
         release(sendBye: ending != .remote)
         if speaking {
             speaking = false
@@ -687,7 +837,89 @@ final class RtcCallEngine: GraineRtcCall {
         control?.close()
         media?.close()
         media = nil
-        parts.audio.callEnds()
+        if audioTaken {
+            audioTaken = false
+            parts.audio.callEnds()
+        }
+    }
+
+    // MARK: - Analytics rows
+
+    /**
+     * THE CALL'S ANALYTICS ROWS (GraineCallTelemetry, contract v1), on its own
+     * control channel: it keeps them until it joins and drops them if it never
+     * does, so a row never delays the call or its hang-up. Durations in whole
+     * milliseconds, measured on the call's clock; never an id or an identity.
+     */
+    private func sendRow(_ name: String, _ data: [String: Any?]) {
+        guard let frame = GraineCallTelemetry.frame(name, data) else { return }
+        control?.send(frame, kind: nil)
+    }
+
+    private func span(_ from: Double?, _ to: Double?) -> Int? {
+        GraineCallTelemetry.milliseconds(from: from, to: to)
+    }
+
+    /**
+     * At media, once: the transport row its dialler wrote, then the connect
+     * row. total = setup + dial: the tap (`begin`) to the last INVITE, that
+     * INVITE to the answer. Prepared means set up and registered before the
+     * tap; then mint, gather and register are the preparation's own times,
+     * and its age at the tap is said. Cold, they are inside setup.
+     */
+    private func sendConnectRow() {
+        if let row = transportRow { control?.send(row, kind: nil) }
+        let prepared = preparedAhead && readyAtTap
+        let tap = marks["begin"] ?? startedAt
+        let answered = marks["answered"] ?? clock.now
+        let invite = lastInviteAt ?? marks["invite"] ?? answered
+        let setup = span(tap, invite), dial = span(invite, answered)
+        var total = span(tap, answered)
+        if let setup = setup, let dial = dial { total = setup + dial }
+        sendRow("connect", [
+            "mode": prepared ? "prepared" : "cold",
+            "warm": prepared,
+            "total_ms": total,
+            "setup_ms": setup,
+            "dial_ms": dial,
+            "mint_ms": span(marks["mint_sent"], marks["minted"]),
+            "mint_route": marks["minted"] == nil ? nil : (mintedDirect ? "direct" : "web"),
+            "gather_ms": span(marks["minted"], marks["offer"]),
+            "register_ms": firstRegisterMs,
+            "redials": max(0, dials - 1),
+            "prepared_age_s": prepared ? max(0, tap - startedAt) : nil,
+            "ice_ms": span(answered, marks["connected"]),
+        ])
+    }
+
+    /// When the agent's voice is first heard, once: from the tap, from the answer, the first audio of any kind, the codec and our side of the path.
+    private func sendVoiceRow(_ stats: RtcInboundAudio) {
+        let voice = marks["first_voice"] ?? clock.now
+        sendRow("voice", [
+            "tap_to_voice_ms": span(marks["begin"] ?? startedAt, voice),
+            "answer_to_voice_ms": span(marks["answered"], voice),
+            "first_audio_ms": span(marks["answered"], marks["first_packet"]),
+            "codec": stats.codecName,
+            "candidate": stats.candidate,
+        ])
+    }
+
+    /// Each time the connection heals: what healed it, and how long the trouble lasted.
+    private func sendRecoveryRow(_ what: String, since: Double) {
+        sendRow("recovery", ["what": what, "after_ms": span(since, clock.now)])
+    }
+
+    /// At the end of a call that had media, once, best effort: how long, and how the audio fared.
+    private func sendQualityRow() {
+        guard !qualitySent, let connected = marks["connected"] else { return }
+        qualitySent = true
+        sendRow("quality", [
+            "duration_s": max(0, clock.now - connected),
+            "loss_pct": quality.lossPercent,
+            "jitter_avg_ms": quality.jitterAverageMs,
+            "jitter_max_ms": quality.jitterMaxMs,
+            "rtt_avg_ms": quality.roundTripAverageMs,
+        ])
     }
 
     // MARK: - Events and the log
@@ -720,7 +952,16 @@ final class RtcCallEngine: GraineRtcCall {
         sinkLock.lock()
         silenced = true
         held = []
+        preparedSink = nil
         sinkLock.unlock()
+    }
+
+    /// Tell whoever prepared the call ahead of its dial (nobody, once it is dialled or hung up).
+    private func notePrepared(_ state: GraineRtcPreparedState) {
+        sinkLock.lock()
+        let target = silenced ? nil : preparedSink
+        sinkLock.unlock()
+        target?(state)
     }
 
     private func trace(_ line: String) {
@@ -756,4 +997,40 @@ final class RtcCallEngine: GraineRtcCall {
         default: return .error
         }
     }
+}
+
+/// The receiver's numbers across a call, from the five-a-second readings: for its quality row.
+struct RtcQualitySamples {
+    private var jitterSum = 0.0
+    private var jitterMax = 0.0
+    private var jitterCount = 0
+    private var roundTripSum = 0.0
+    private var roundTripCount = 0
+    private var lost = 0
+    private var received = 0
+
+    mutating func add(_ stats: RtcInboundAudio) {
+        // The counters are the call's running totals: the latest reading is the whole call's.
+        lost = max(lost, stats.packetsLost)
+        received = max(received, stats.packetsReceived)
+        if stats.packetsReceived > 0, stats.jitter.isFinite, stats.jitter >= 0 {
+            jitterSum += stats.jitter
+            jitterMax = max(jitterMax, stats.jitter)
+            jitterCount += 1
+        }
+        if let rtt = stats.roundTrip, rtt.isFinite, rtt >= 0 {
+            roundTripSum += rtt
+            roundTripCount += 1
+        }
+    }
+
+    /// Lost of all sent, in percent; nil before any packet.
+    var lossPercent: Double? {
+        let all = lost + received
+        return all > 0 ? Double(lost) / Double(all) * 100 : nil
+    }
+
+    var jitterAverageMs: Double? { jitterCount > 0 ? jitterSum / Double(jitterCount) * 1000 : nil }
+    var jitterMaxMs: Double? { jitterCount > 0 ? jitterMax * 1000 : nil }
+    var roundTripAverageMs: Double? { roundTripCount > 0 ? roundTripSum / Double(roundTripCount) * 1000 : nil }
 }

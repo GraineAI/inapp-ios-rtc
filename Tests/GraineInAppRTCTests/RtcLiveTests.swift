@@ -132,7 +132,7 @@ import Testing
             debug: true,
             // The real module, minting where nothing answers: the mint fails, the socket carries the call.
             rtcModule: { FallbackProbeModule() },
-            takePrepared: { _ in nil },
+            takePrepared: { _, _ in nil },
             onTransport: { reports.add($0) },
             onEvent: { events.add($0) }
         )

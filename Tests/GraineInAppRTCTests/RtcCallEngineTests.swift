@@ -12,7 +12,7 @@ import Testing
  */
 
 final class EngineRig {
-    let clock = ManualRtcClock()
+    let clock: ManualRtcClock
     let sockets = MemorySocketFactory()
     let sbc = ScriptedSbc()
     let media = ScriptedMedia()
@@ -22,14 +22,23 @@ final class EngineRig {
     private(set) var mintSessionIds: [String] = []
     let engine: RtcCallEngine
 
-    init(budget: Double = 12) {
+    /// `direct`: the direct mint the call asks first (DirectRig places such calls); without it, the web route only. `rang`: a call that rang.
+    init(
+        budget: Double = 12,
+        clock: ManualRtcClock = ManualRtcClock(),
+        direct: RtcDirectMint? = nil,
+        rang: Bool = false,
+        body: @escaping (String) -> Data = { id in Data(#"{"publishableKey":"pk_test_rig","session_id":"\#(id)"}"#.utf8) }
+    ) {
+        self.clock = clock
         let parts = RtcCallEngine.Parts(
             clock: clock,
             sockets: sockets,
             minting: minting,
             random: CountingRandom(),
             makeMedia: { [media] _ in media },
-            audio: audio
+            audio: audio,
+            direct: direct
         )
         var ids: [String] = []
         let request = GraineRtcRequest(
@@ -37,11 +46,12 @@ final class EngineRig {
             controlHost: "wss://ws.graine.ai",
             mintBody: { id in
                 ids.append(id)
-                return Data(#"{"publishableKey":"pk_test_rig","session_id":"\#(id)"}"#.utf8)
+                return body(id)
             },
             sdkVersion: "0.7.0",
             budgetSeconds: budget,
-            debug: true
+            debug: true,
+            rang: rang
         )
         engine = RtcCallEngine(request: request, parts: parts)
         let sbc = self.sbc

@@ -19,6 +19,8 @@ protocol RtcClock: AnyObject {
     var now: Double { get }
     /// Run on the context, after the current work.
     func run(_ block: @escaping () -> Void)
+    /// Run on the context and wait for its answer — for a caller elsewhere that needs it now. Never from the context itself.
+    func sync<T>(_ block: () -> T) -> T
     /// Run on the context after `seconds`.
     @discardableResult
     func after(_ seconds: Double, _ block: @escaping () -> Void) -> RtcTimer
@@ -35,6 +37,10 @@ final class DispatchRtcClock: RtcClock {
 
     func run(_ block: @escaping () -> Void) {
         queue.async(execute: block)
+    }
+
+    func sync<T>(_ block: () -> T) -> T {
+        queue.sync(execute: block)
     }
 
     @discardableResult

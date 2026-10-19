@@ -9,6 +9,11 @@ import Foundation
  * the ICE servers to reach it through. Every gate (credits, the agent being
  * on, the allowed domains) runs on that request; a refusal sends the call to
  * the WebSocket, which refuses it again in its own words.
+ *
+ * The answer may carry a grant as well (`direct`), for this same call: with a
+ * grant asked for exactly a call in hand, that call asks the telephony gateway
+ * itself, next to the SBC — Engine/RtcDirectMint.swift — and this request is
+ * the fallback.
  */
 
 struct RtcCredential: Equatable {
@@ -21,6 +26,8 @@ struct RtcCredential: Equatable {
     var iceServers: [RtcIceServer]
     /// When the credential stops working, by the device's clock; nil when the answer did not say.
     var expiresAt: Date?
+    /// The grant the web route signed beside it (`direct`): this call's own, for its redials (Engine/RtcDirectMint.swift).
+    var direct: RtcDirectOffer? = nil
 
     /// Seconds of life left at `now`; infinite when unknown.
     func remaining(at now: Date) -> Double {
@@ -58,7 +65,8 @@ struct RtcCredential: Equatable {
             applicationSid: application,
             agentId: agent,
             iceServers: servers,
-            expiresAt: text("expires_at").flatMap(Self.date)
+            expiresAt: text("expires_at").flatMap(Self.date),
+            direct: RtcDirectOffer.parse(object["direct"])
         )
     }
 

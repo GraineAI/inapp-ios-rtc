@@ -179,6 +179,7 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
             }
             if var audio = found, let id = codecId, let codec = report.statistics[id] {
                 audio.codec = codec.values["mimeType"] as? String
+                audio.clockRate = (codec.values["clockRate"] as? NSNumber)?.intValue
                 found = audio
             }
             // The pair ICE chose: which kind of path the call took, and how long a round trip is on it.
@@ -188,6 +189,7 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
                     (pair.values[key] as? String).flatMap { report.statistics[$0]?.values["candidateType"] as? String } ?? "?"
                 }
                 audio.path = "\(type("localCandidateId")) → \(type("remoteCandidateId"))"
+                audio.candidate = type("localCandidateId")
                 audio.roundTrip = (pair.values["currentRoundTripTime"] as? NSNumber)?.doubleValue
                 found = audio
             }

@@ -14,20 +14,25 @@ import LiveKitWebRTC
  * session; then it is told so, configured for a call (play and record, voice
  * chat, Bluetooth headsets) inside its own lock, and enabled — and only then
  * does the INVITE leave. Manual audio only while the call lasts: an app that
- * uses the same library for something else gets its settings back.
+ * uses the same library for something else gets its settings back — once the
+ * last leg holding the gate lets it go (a call prepared before the tap, a
+ * ring's, another agent's may overlap).
  */
 final class RtcAudioGate: RtcAudioControl {
     static let shared = RtcAudioGate()
 
     private let lock = NSLock()
     private var saved: (manual: Bool, enabled: Bool)?
+    /// The legs holding the gate now.
+    private var holders = 0
 
     private var session: LKRTCAudioSession { LKRTCAudioSession.sharedInstance() }
 
     func callBegins() {
         lock.lock()
         defer { lock.unlock() }
-        if saved == nil { saved = (session.useManualAudio, session.isAudioEnabled) }
+        if holders == 0 { saved = (session.useManualAudio, session.isAudioEnabled) }
+        holders += 1
         session.useManualAudio = true
         session.isAudioEnabled = false
     }
@@ -52,6 +57,8 @@ final class RtcAudioGate: RtcAudioControl {
     func callEnds() {
         lock.lock()
         defer { lock.unlock() }
+        holders = max(0, holders - 1)
+        guard holders == 0 else { return }
         session.isAudioEnabled = false
         if let saved = saved {
             session.useManualAudio = saved.manual

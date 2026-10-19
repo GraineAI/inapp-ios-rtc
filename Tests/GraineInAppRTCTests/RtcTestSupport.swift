@@ -29,6 +29,10 @@ final class ManualRtcClock: RtcClock {
         block()
     }
 
+    func sync<T>(_ block: () -> T) -> T {
+        block()
+    }
+
     @discardableResult
     func after(_ seconds: Double, _ block: @escaping () -> Void) -> RtcTimer {
         seq += 1
@@ -141,7 +145,16 @@ final class ScriptedSbc {
     var sendTrying = true
     var answerSdp = TraceSdp.answer
     var received: [SipMessage] = []
+    /// Hold the INVITE's final answer until the test releases it (`releaseFinal`), so a test can say how long the dial took.
+    var holdFinal = false
+    private var heldFinal: (() -> Void)?
     private var nonce = 0
+
+    func releaseFinal() {
+        let held = heldFinal
+        heldFinal = nil
+        held?()
+    }
 
     func attach(_ socket: MemorySocket) {
         socket.onSend = { [weak self, weak socket] text in
@@ -172,11 +185,16 @@ final class ScriptedSbc {
                 return
             }
             if let code = inviteFinal {
-                if code == 200 {
-                    socket.deliver(Self.reply(m, 200, toTag: "cByBmmry4gpBj", extra: ["Contact: <sip:198.51.100.7:5060;transport=tcp>", "Content-Type: application/sdp", "X-Call-Sid: 208fd2fd"], body: answerSdp))
-                } else {
-                    socket.deliver(Self.reply(m, code, toTag: "fail1"))
+                let sdp = answerSdp
+                let answer = { [weak socket] in
+                    guard let socket = socket else { return }
+                    if code == 200 {
+                        socket.deliver(Self.reply(m, 200, toTag: "cByBmmry4gpBj", extra: ["Contact: <sip:198.51.100.7:5060;transport=tcp>", "Content-Type: application/sdp", "X-Call-Sid: 208fd2fd"], body: sdp))
+                    } else {
+                        socket.deliver(Self.reply(m, code, toTag: "fail1"))
+                    }
                 }
+                if holdFinal { heldFinal = answer } else { answer() }
             }
         case "BYE", "UPDATE", "CANCEL":
             socket.deliver(Self.reply(m, 200))
@@ -311,6 +329,201 @@ enum MintFixture {
     "ice_servers":[{"urls":"stun:stun.relay.example.test:80"},{"urls":["turn:relay.example.test:80","turns:relay.example.test:443?transport=tcp"],"username":"u","credential":"c"}],\
     "agent_id":"agent-webcall-1","direct":{"url":"wss://ignored.example.test"}}
     """
+}
+
+// MARK: - The direct mint's network
+
+/**
+ * The web route's grant-only mode, the gateway's probe and its direct mint,
+ * answered as production answers them (the web route, and the call servers'
+ * POST and GET of the direct route) unless the test says
+ * otherwise — or held until it releases them. Every request is recorded.
+ */
+final class ScriptedGateway: RtcHTTP {
+    enum Kind: Equatable {
+        case grantOnly, probe, direct
+    }
+
+    struct Sent {
+        let url: URL
+        /// The body, read back; nil for a GET.
+        let json: [String: Any]?
+        let timeout: Double
+
+        var kind: Kind {
+            if json == nil { return .probe }
+            return json?["grant_only"] as? Bool == true ? .grantOnly : .direct
+        }
+
+        var grant: String? { json?["grant"] as? String }
+    }
+
+    private(set) var sent: [Sent] = []
+    /// Each grant-only request is answered with the next grant (`DirectFixture.grant(1)`, then 2…), unless replaced.
+    private(set) var grantsIssued = 0
+    var grantOnly: ((Int) -> RtcHTTPAnswer)?
+    var probe: RtcHTTPAnswer = .answered(status: 200, data: Data(#"{"direct":true}"#.utf8))
+    /// The direct mints' answers, in order; once spent, a credential.
+    var direct: [RtcHTTPAnswer] = []
+    var holding: Set<Kind> = []
+    private var held: [(kind: Kind, answer: () -> Void)] = []
+
+    func send(_ url: URL, json: Data?, timeout: Double, done: @escaping (RtcHTTPAnswer) -> Void) {
+        let request = Sent(url: url, json: json.map { ((try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]) ?? [:] }, timeout: timeout)
+        sent.append(request)
+        let answer: RtcHTTPAnswer
+        switch request.kind {
+        case .grantOnly:
+            grantsIssued += 1
+            answer = grantOnly?(grantsIssued) ?? .answered(status: 200, data: DirectFixture.grantOnlyAnswer(grantsIssued))
+        case .probe:
+            answer = probe
+        case .direct:
+            answer = direct.isEmpty ? .answered(status: 200, data: Data(MintFixture.response.utf8)) : direct.removeFirst()
+        }
+        if holding.contains(request.kind) {
+            held.append((request.kind, { done(answer) }))
+        } else {
+            done(answer)
+        }
+    }
+
+    /// Answer what was held of one kind, in order.
+    func release(_ kind: Kind) {
+        holding.remove(kind)
+        let now = held.filter { $0.kind == kind }
+        held.removeAll { $0.kind == kind }
+        for item in now { item.answer() }
+    }
+
+    func kinds() -> [Kind] { sent.map(\.kind) }
+    var directs: [Sent] { sent.filter { $0.kind == .direct } }
+}
+
+enum DirectFixture {
+    static let base = "https://www.graine.ai"
+    static let key = "pk_test_rig"
+    static let route = URL(string: "https://gw.example.test/direct/grant-session")!
+    /// Production's grant life: fifteen minutes.
+    static let ttlMs = 900_000.0
+    /// The wall clock the rig starts at (epoch seconds).
+    static let wall = 1_792_000_000.0
+
+    static func grant(_ n: Int) -> String { "v1.grant-\(n).sig" }
+
+    /// An offer as the web route writes it (lib/rtc-grant.ts DirectMintOffer).
+    static func offerJSON(_ n: Int, ttlMs: Double? = DirectFixture.ttlMs, expiresAtMs: Double = (wall + 900) * 1000) -> [String: Any] {
+        var o: [String: Any] = ["grant": grant(n), "expires_at": expiresAtMs, "url": route.absoluteString]
+        if let ttl = ttlMs { o["ttl_ms"] = ttl }
+        return o
+    }
+
+    static func offer(_ n: Int) -> RtcDirectOffer { RtcDirectOffer.parse(offerJSON(n))! }
+
+    static func grantOnlyAnswer(_ n: Int) -> Data {
+        try! JSONSerialization.data(withJSONObject: ["direct": offerJSON(n)])
+    }
+
+    static func refusal(_ status: Int, _ code: String?, _ detail: String = "No.") -> RtcHTTPAnswer {
+        var o: [String: Any] = ["detail": detail]
+        if let code = code { o["code"] = code }
+        return .answered(status: status, data: try! JSONSerialization.data(withJSONObject: o))
+    }
+
+    /**
+     * A call's mint body as the core writes it (RtcMintBody): the key, the
+     * session, the call's variables, who the customer is — and the call's id
+     * when it names one.
+     */
+    static func body(sessionId: String = "0123456789abcdef0123456789abcdef", customer: String? = "customer-1", memory: Bool = true, callId: String? = nil) -> Data {
+        var o: [String: Any] = [
+            "publishableKey": key,
+            "session_id": sessionId,
+            "variables": ["who_called": "customer", "call_reason": "card_blocked"],
+            "installId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+            "memory": memory,
+            "timezone": "Asia/Kolkata",
+        ]
+        if let customer = customer { o["identity"] = ["value": customer] }
+        if let callId = callId { o["callId"] = callId }
+        return try! JSONSerialization.data(withJSONObject: o)
+    }
+}
+
+/**
+ * The direct mint on fakes, shared by the calls a test places one after
+ * another: one clock for it and them, the network scripted. The wall clock
+ * moves with that clock, plus `skew`: a device set ahead of the server, or a
+ * phone that slept (the wall moved, the clock that schedules did not).
+ */
+final class DirectRig {
+    let clock = ManualRtcClock()
+    let gateway = ScriptedGateway()
+    var skew = 0.0
+    private let start: Double
+    /// Next-call ids handed out (`call_next1`, `call_next2`…), and ids calls took of their own (`call_own1`…).
+    private(set) var nextIds = 0
+    private(set) var ownIds = 0
+    /// The id the last placed call took.
+    private(set) var lastId: String?
+    private(set) lazy var mint = RtcDirectMint(
+        clock: clock,
+        http: gateway,
+        wallNow: { [unowned self] in Date(timeIntervalSince1970: DirectFixture.wall + self.skew + (self.clock.now - self.start)) },
+        newCallId: { [unowned self] in
+            self.nextIds += 1
+            return "call_next\(self.nextIds)"
+        }
+    )
+
+    init() {
+        start = clock.now
+    }
+
+    /// What the core does when the session arrives, the customer changes or the app comes back: the next call's grant.
+    func warm(customer: String? = "customer-1", memory: Bool = true) {
+        mint.warm(baseUrl: DirectFixture.base, body: DirectFixture.body(sessionId: "", customer: customer, memory: memory))
+    }
+
+    /// What the core does when a call rings: a grant for exactly its id.
+    func ring(_ callId: String, customer: String? = "customer-1") {
+        mint.warm(baseUrl: DirectFixture.base, body: DirectFixture.body(sessionId: "", customer: customer, callId: callId))
+    }
+
+    /// What `GraineCalls.startCall` asks: the next call's id, while its grant is usable.
+    func take(customer: String? = "customer-1", memory: Bool = true) -> String? {
+        mint.takeCallId(baseUrl: DirectFixture.base, body: DirectFixture.body(sessionId: "", customer: customer, memory: memory))
+    }
+
+    /// A call the customer places, as startCall places it: the next call's id when it can take it, else one of its own.
+    func place(customer: String? = "customer-1", memory: Bool = true) -> EngineRig {
+        let id = take(customer: customer, memory: memory) ?? {
+            ownIds += 1
+            return "call_own\(ownIds)"
+        }()
+        lastId = id
+        return call(callId: id, customer: customer, memory: memory)
+    }
+
+    /// A call with exactly this id (a ring answered, a call placed elsewhere) on this direct mint; `rang`: prepared for a ring.
+    func call(callId: String?, customer: String? = "customer-1", memory: Bool = true, rang: Bool = false) -> EngineRig {
+        EngineRig(clock: clock, direct: mint, rang: rang) { id in
+            DirectFixture.body(sessionId: id, customer: customer, memory: memory, callId: callId)
+        }
+    }
+
+    /// The agent's next call's id and grant.
+    var next: (callId: String?, grant: String)? { mint.nextGrant(baseUrl: DirectFixture.base, publishableKey: DirectFixture.key) }
+
+    /// The grant held for one call — for whoever, or for exactly one customer (nil: nobody known, the anonymous request).
+    func grant(for callId: String?) -> String? {
+        mint.grant(baseUrl: DirectFixture.base, publishableKey: DirectFixture.key, callId: callId)
+    }
+
+    func grant(for callId: String?, customer: String?) -> String? {
+        let identity = RtcMintBodyParts(DirectFixture.body(sessionId: "", customer: customer))!.identityKey
+        return mint.grant(baseUrl: DirectFixture.base, publishableKey: DirectFixture.key, callId: callId, identity: identity)
+    }
 }
 
 // MARK: - SDP from the production trace

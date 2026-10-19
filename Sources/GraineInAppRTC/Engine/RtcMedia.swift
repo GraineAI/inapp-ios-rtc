@@ -26,6 +26,16 @@ struct RtcInboundAudio: Equatable {
     /// The path in use, "relay → host" (ours → theirs), and its round trip in seconds — once ICE has chosen one.
     var path: String? = nil
     var roundTrip: Double? = nil
+    /// The codec's clock rate (8000, 48000) — once known.
+    var clockRate: Int? = nil
+    /// Our side of that path: "host", "srflx", "prflx" or "relay".
+    var candidate: String? = nil
+
+    /// "audio/PCMU/8000": the codec and its clock rate, for the voice row (which writes it the SDP way, "PCMU/8000").
+    var codecName: String? {
+        guard let mime = codec else { return nil }
+        return clockRate.map { "\(mime)/\($0)" } ?? mime
+    }
 }
 
 struct RtcMediaError: Error, Equatable, CustomStringConvertible {
