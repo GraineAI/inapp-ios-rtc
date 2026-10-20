@@ -71,14 +71,32 @@ enum DialRules {
     /// From the INVITE leaving to the answer. Production answers in 0.2–0.9 s.
     static let answerDeadline = 15.0
     /**
-     * From the SBC's first reply to the answer. The SBC replies the moment it has the INVITE, and a
-     * healthy call is answered right after: 37 ms median on production, measured at the SBC on
-     * 18 Oct 2026. One that has said "trying" and then nothing for half a second is stuck — a feature
-     * server that took the call and never answered — so it is cancelled and dialled once more on a
-     * fresh connection. A seatbelt, and a short one: 0.10.2's 3 s was 80× a normal answer and only
-     * delayed the fallback; this is still ~13× the median, so a healthy call never trips it.
+     * From the SBC's first provisional reply to the AUTHENTICATED INVITE, to the answer. The SBC
+     * replies the moment it has the INVITE, and a healthy call is answered right after: 37 ms median
+     * on production, measured at the SBC on 18 Oct 2026. One that has said "trying" and then nothing
+     * for half a second is stuck — a feature server that took the call and never answered — so it is
+     * cancelled and dialled once more on a fresh connection. A seatbelt, and a short one: 0.10.2's
+     * 3 s was 80× a normal answer and only delayed the fallback; this is still ~13× the median, so a
+     * healthy call never trips it.
+     *
+     * The SBC challenges every INVITE (401 or 407) and the INVITE goes again with credentials, so the
+     * first reply a dial hears belongs to an INVITE that is about to be refused — and the challenge
+     * itself is a reply too. Timed from either, this half second also had to hold the challenge, the
+     * second INVITE's whole round trip and the server's answer time, and a healthy call on a slow
+     * mobile link was dialled twice (20 Oct 2026). So a challenge is not "heard": a clock started
+     * before it stops there, and starts again at the first provisional reply to the INVITE with
+     * credentials (RtcCallEngine, `.challenged`).
      */
     static let answerAfterHeard = 0.5
+    /**
+     * How long a dial given up on keeps its socket for its own ending: its CANCEL and the 487, or the
+     * ACK and BYE of an answer that crossed the CANCEL, all travel on the socket the dial was placed
+     * on. Closed sooner (it used to go as soon as its un-REGISTER was answered), a late reply found it
+     * gone and the server's leg stayed up — its agent running beside the redial's — until the server
+     * gave up on its ACK. A few round trips on the slowest link a call still connects on. The
+     * registration is withdrawn at once.
+     */
+    static let abandonedDialGrace = 4.0
     /// Answered, and still no media path after this: the customer's patience, not ICE's 30 s.
     static let iceConnectDeadline = 8.0
     /// The REGISTER's bound: success, an explicit refusal, or this.
@@ -87,7 +105,8 @@ enum DialRules {
     static let credentialMinRemaining = 20.0
 
     /**
-     * From the INVITE leaving to ANY reply. The SBC answers 100 Trying the
+     * From the INVITE leaving to any reply to the INVITE in flight — after a
+     * challenge, the one with credentials. The SBC answers 100 Trying the
      * moment it has the request, so silence past this is a socket that is not
      * delivering. Twice the link's own registration time, 3–8 s; 4 s unknown.
      */

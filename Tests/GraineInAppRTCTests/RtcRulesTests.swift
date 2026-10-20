@@ -59,6 +59,8 @@ import Testing
         #expect(Double(DialRules.maxDials) * (DialRules.answerAfterHeard + 1) < 12)
         #expect(DialRules.iceConnectDeadline == 8)
         #expect(DialRules.registerDeadline == 15)
+        // A dial given up on keeps its socket for its CANCEL's ending: the voice bar's grace.
+        #expect(DialRules.abandonedDialGrace == 4)
     }
 
     /// dialFailureVerdict, with JsSIP's words for each SIP status.

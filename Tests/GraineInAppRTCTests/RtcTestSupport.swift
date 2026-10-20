@@ -212,6 +212,23 @@ final class ScriptedSbc {
         "WWW-Authenticate: Digest realm=\"sbc.example.test\", algorithm=MD5, qop=\"auth\", nonce=\"\(nonce)\""
     }
 
+    /**
+     * The challenge to `m` — a 401 with WWW-Authenticate, or a 407 with
+     * Proxy-Authenticate — for a test that answers an INVITE itself, at the
+     * moment it chooses (`answerByHand` on the engine's rig).
+     */
+    static func challenge(_ m: SipMessage, _ code: Int = 401, nonce: String = "by-hand") -> String {
+        let header = code == 407
+            ? "Proxy-Authenticate: Digest realm=\"sbc.example.test\", algorithm=MD5, qop=\"auth\", nonce=\"\(nonce)\""
+            : wwwAuthenticate(nonce)
+        return reply(m, code, toTag: "chal1", extra: [header])
+    }
+
+    /// The answer to an INVITE, as production's 200 carries it: the SBC's Contact, its call id, the trace's SDP.
+    static func answer(_ m: SipMessage) -> String {
+        reply(m, 200, toTag: "cByBmmry4gpBj", extra: ["Contact: <sip:198.51.100.7:5060;transport=tcp>", "Content-Type: application/sdp", "X-Call-Sid: 208fd2fd"], body: TraceSdp.answer)
+    }
+
     /// A response to `m`, shaped like the SBC's: its Via (with received/rport), From, To (+tag), Call-ID and CSeq.
     static func reply(_ m: SipMessage, _ code: Int, toTag: String? = nil, extra: [String] = [], body: String = "") -> String {
         var out = "SIP/2.0 \(code) \(SipShape.reasons[code] ?? "Whatever")\r\n"
@@ -253,9 +270,18 @@ final class ScriptedMedia: RtcMedia {
         pendingOffer = nil
     }
 
+    /// Hold applyAnswer's completion until the test finishes it (`finishAnswer`): an answer still being applied.
+    var holdAnswer = false
+    private var pendingAnswer: ((RtcMediaError?) -> Void)?
+
     func applyAnswer(_ sdp: String, done: @escaping (RtcMediaError?) -> Void) {
         appliedAnswers.append(sdp)
-        done(answerError)
+        if holdAnswer { pendingAnswer = done } else { done(answerError) }
+    }
+
+    func finishAnswer() {
+        pendingAnswer?(answerError)
+        pendingAnswer = nil
     }
 
     func answer(offer sdp: String, done: @escaping (Result<String, RtcMediaError>) -> Void) {

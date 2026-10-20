@@ -82,6 +82,13 @@ final class EngineRig {
         media.ice(.connected)
     }
 
+    /// The SBC says nothing to an INVITE (nor challenges a REGISTER): the test writes each reply to each INVITE, when it says.
+    func answerByHand() {
+        sbc.challenge = false
+        sbc.sendTrying = false
+        sbc.inviteFinal = nil
+    }
+
     var invites: [SipMessage] { sbc.received.filter { $0.method == "INVITE" && $0.toTag == nil } }
 
     var names: [String] {
@@ -276,6 +283,197 @@ final class EngineRig {
         #expect(rig.names == ["ready"], "the second dial gets its own half second")
         rig.clock.advance(0.2)
         #expect(rig.names == ["ready", "unreachable(no_answer)"])
+    }
+
+    // MARK: The answer clock runs from the INVITE with credentials' own reply
+
+    /// 20 Oct 2026, production: answered 181 ms after its own reply and dialled again anyway — timed from the first INVITE's reply.
+    @Test func aChallengedDialAnsweredInsideHalfASecondOfItsOwnReplyIsNeverDialledAgain() throws {
+        let rig = EngineRig()
+        rig.answerByHand()
+        rig.ready()
+        rig.engine.audioActivated()
+        let sip = rig.sockets.sip[0]
+        let first = try #require(rig.invites.first)
+        sip.deliver(ScriptedSbc.reply(first, 100))           // 100 Trying to the first INVITE: a clock starts for it…
+        rig.clock.advance(0.03)
+        sip.deliver(ScriptedSbc.challenge(first))            // …and stops at the challenge
+        let second = try #require(rig.invites.last)
+        #expect(rig.invites.count == 2 && second.header("Authorization") != nil, "sent again with credentials")
+        rig.clock.advance(0.47)
+        sip.deliver(ScriptedSbc.reply(second, 100))          // the INVITE with credentials' own reply, 500 ms in
+        rig.clock.advance(0.425)                             // answered 425 ms after it: 925 ms after the first reply
+        sip.deliver(ScriptedSbc.answer(second))
+        rig.media.ice(.connected)
+        #expect(rig.names == ["ready", "connected"])
+        #expect(rig.sockets.sip.count == 1, "a healthy, challenged call was dialled a second time")
+        #expect(!rig.sbc.received.contains { $0.method == "CANCEL" })
+        #expect(rig.lines.contains { $0.contains("challenged (401) after 30 ms") })
+    }
+
+    /// The 407 itself used to count as the reply the half second ran from.
+    @Test func aChallengeIsNotHeardEvenWithNoReplyBeforeIt() throws {
+        let rig = EngineRig()
+        rig.answerByHand()
+        rig.ready()
+        rig.engine.audioActivated()
+        let sip = rig.sockets.sip[0]
+        rig.clock.advance(0.01)
+        sip.deliver(ScriptedSbc.challenge(try #require(rig.invites.first), 407))   // a proxy challenge, no 100 Trying before it
+        let second = try #require(rig.invites.last)
+        #expect(second.header("Proxy-Authorization") != nil)
+        rig.clock.advance(0.6)
+        #expect(rig.sockets.sip.count == 1, "the challenge started an answer clock")
+        sip.deliver(ScriptedSbc.reply(second, 100))
+        rig.clock.advance(0.4)
+        sip.deliver(ScriptedSbc.answer(second))
+        rig.media.ice(.connected)
+        #expect(rig.names == ["ready", "connected"])
+        #expect(rig.sockets.sip.count == 1)
+    }
+
+    @Test func anInviteWithCredentialsThatHearsNothingIsNoResponseNotAStuckDial() throws {
+        let rig = EngineRig(budget: 60)
+        rig.answerByHand()
+        rig.ready()
+        rig.engine.audioActivated()
+        let sip = rig.sockets.sip[0]
+        let first = try #require(rig.invites.first)
+        sip.deliver(ScriptedSbc.reply(first, 100))
+        sip.deliver(ScriptedSbc.challenge(first))
+        rig.clock.advance(3.9)
+        #expect(rig.sockets.sip.count == 1, "an answer clock ran for an INVITE that has heard nothing")
+        rig.clock.advance(0.2)
+        #expect(rig.sockets.sip.count == 2, "silence from the INVITE in flight: one fresh connection")
+        #expect(rig.lines.contains { $0.contains("no reply to the INVITE") })
+    }
+
+    @Test func anAnswerStillBeingAppliedWhenTheHalfSecondRunsOutIsNotAStuckDial() throws {
+        let rig = EngineRig()
+        rig.answerByHand()
+        rig.media.holdAnswer = true
+        rig.ready()
+        rig.engine.audioActivated()
+        let sip = rig.sockets.sip[0]
+        sip.deliver(ScriptedSbc.challenge(try #require(rig.invites.first)))
+        let second = try #require(rig.invites.last)
+        sip.deliver(ScriptedSbc.reply(second, 100))
+        rig.clock.advance(DialRules.answerAfterHeard - 0.001)
+        sip.deliver(ScriptedSbc.answer(second))              // the 200 is in; its SDP is still being applied
+        rig.clock.advance(1)
+        #expect(rig.sockets.sip.count == 1, "an answered dial was dialled again while its answer was applied")
+        #expect(!rig.sbc.received.contains { $0.method == "CANCEL" || $0.method == "BYE" })
+        rig.media.finishAnswer()
+        rig.media.ice(.connected)
+        #expect(rig.names == ["ready", "connected"])
+    }
+
+    // MARK: A dial given up on ends on the server, on its own socket
+
+    @Test func aStuckDialIsCancelledOnItsOwnSocketWhichStaysUntilItsInviteHasItsFinalAnswer() throws {
+        let rig = EngineRig()
+        rig.answerByHand()
+        rig.ready()
+        rig.engine.audioActivated()
+        let old = rig.sockets.sip[0]
+        let first = try #require(rig.invites.first)
+        old.deliver(ScriptedSbc.reply(first, 100))
+        rig.clock.advance(0.04)
+        old.deliver(ScriptedSbc.challenge(first))
+        let second = try #require(rig.invites.last)
+        rig.clock.advance(0.2)
+        old.deliver(ScriptedSbc.reply(second, 100))          // its own reply — and then nothing
+        rig.clock.advance(DialRules.answerAfterHeard - 0.01)
+        #expect(rig.sockets.sip.count == 1)
+        rig.clock.advance(0.02)
+        #expect(rig.sockets.sip.count == 2, "dialled again on a fresh connection")
+        let cancels = old.sentMessages.filter { $0.method == "CANCEL" }
+        #expect(cancels.map(\.topViaBranch) == [second.topViaBranch], "the INVITE with credentials is the one cancelled")
+        #expect(old.sentMessages.last { $0.method == "REGISTER" }?.header("Expires") == "0", "its registration went at once")
+        rig.clock.advance(2.5)
+        #expect(!old.closedByClient, "the socket the CANCEL's ending travels on went first")
+        old.deliver(ScriptedSbc.reply(second, 487, toTag: "t487"))
+        #expect(old.sentMessages.last?.method == "ACK", "the 487 is ACKed on its own socket")
+        rig.clock.advance(0.1)
+        #expect(old.closedByClient, "then that socket goes")
+        #expect(rig.names == ["ready"], "the old dial told this call nothing")
+    }
+
+    @Test func anAnswerThatCrossesAnAbandonedDialsCancelIsAckedAndEndedOnItsOwnSocket() throws {
+        let rig = EngineRig()
+        rig.answerByHand()
+        rig.ready()
+        rig.engine.audioActivated()
+        let old = rig.sockets.sip[0]
+        old.deliver(ScriptedSbc.challenge(try #require(rig.invites.first)))
+        let second = try #require(rig.invites.last)
+        old.deliver(ScriptedSbc.reply(second, 100))
+        rig.clock.advance(DialRules.answerAfterHeard + 0.01)
+        #expect(rig.sockets.sip.count == 2)
+        #expect(old.sentMessages.filter { $0.method == "CANCEL" }.count == 1)
+        // The server answered as the CANCEL left: that leg exists now, and only an ACK and a BYE end it.
+        old.deliver(ScriptedSbc.answer(second))
+        #expect(old.sentMessages.suffix(2).map { $0.method ?? "reply" } == ["ACK", "BYE"])
+        #expect(old.sentMessages.last?.requestUri == "sip:198.51.100.7:5060;transport=tcp")
+        rig.clock.advance(0.1)
+        #expect(old.closedByClient, "the BYE answered, that socket goes")
+        #expect(rig.media.appliedAnswers.isEmpty, "the abandoned dial's answer was taken for this call's")
+        #expect(rig.names == ["ready"])
+    }
+
+    @Test func anAbandonedDialWhoseInviteNeverSettlesLetsItsSocketGoAfterTheGrace() throws {
+        let rig = EngineRig(budget: 60)
+        rig.answerByHand()
+        rig.ready()
+        rig.engine.audioActivated()
+        let old = rig.sockets.sip[0]
+        old.deliver(ScriptedSbc.challenge(try #require(rig.invites.first)))
+        old.deliver(ScriptedSbc.reply(try #require(rig.invites.last), 100))
+        rig.clock.advance(DialRules.answerAfterHeard)
+        #expect(rig.sockets.sip.count == 2)
+        rig.clock.advance(DialRules.abandonedDialGrace - 0.1)
+        #expect(!old.closedByClient)
+        rig.clock.advance(0.2)
+        #expect(old.closedByClient, "a dial with no final answer held its socket for ever")
+    }
+
+    @Test func aHangUpWhileItRingsCancelsTheDialAndKeepsItsSocketUntilTheDialHasEnded() throws {
+        let rig = EngineRig()
+        rig.answerByHand()
+        rig.ready()
+        rig.engine.audioActivated()
+        let sip = rig.sockets.sip[0]
+        sip.deliver(ScriptedSbc.challenge(try #require(rig.invites.first)))
+        let second = try #require(rig.invites.last)
+        sip.deliver(ScriptedSbc.reply(second, 100))
+        rig.engine.hangUp()
+        #expect(sip.sentMessages.filter { $0.method == "CANCEL" }.map(\.topViaBranch) == [second.topViaBranch])
+        rig.clock.advance(1)
+        #expect(!sip.closedByClient, "the socket went before the CANCEL could finish")
+        sip.deliver(ScriptedSbc.reply(second, 487, toTag: "t487"))
+        rig.clock.advance(0.1)
+        #expect(sip.closedByClient)
+    }
+
+    @Test func aHangUpBeforeTheInviteWithCredentialsWasHeardCancelsItAtItsFirstReply() throws {
+        let rig = EngineRig()
+        rig.answerByHand()
+        rig.ready()
+        rig.engine.audioActivated()
+        let sip = rig.sockets.sip[0]
+        let first = try #require(rig.invites.first)
+        sip.deliver(ScriptedSbc.reply(first, 100))
+        sip.deliver(ScriptedSbc.challenge(first))
+        let second = try #require(rig.invites.last)
+        rig.engine.hangUp()
+        #expect(!sip.sentMessages.contains { $0.method == "CANCEL" }, "a CANCEL for an INVITE nothing has replied to")
+        rig.clock.advance(2.5)
+        sip.deliver(ScriptedSbc.reply(second, 100))
+        #expect(sip.sentMessages.filter { $0.method == "CANCEL" }.map(\.topViaBranch) == [second.topViaBranch], "cancelled at its first reply")
+        sip.deliver(ScriptedSbc.answer(second))              // and an answer that crossed that CANCEL is ended
+        #expect(sip.sentMessages.filter { $0.method == "BYE" }.count == 1)
+        rig.clock.advance(0.1)
+        #expect(sip.closedByClient)
     }
 
     @Test func answeredButNoMediaWithin8Seconds() {

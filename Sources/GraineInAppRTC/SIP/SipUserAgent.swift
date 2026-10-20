@@ -11,7 +11,8 @@ import Foundation
  *                   with an ACK and a second INVITE; 1xx noted; the 2xx ACKed
  *                   at once to its Contact, on this same socket
  *   CANCEL / BYE    our hang-up, whichever the call's state needs; a 2xx that
- *                   arrives after our CANCEL is ACKed and then BYEd
+ *                   arrives after our CANCEL is ACKed and then BYEd — the
+ *                   socket kept until the dial has its final answer (shutDown)
  *   the dialog      their BYE (200, the call is over), their re-INVITE or
  *                   UPDATE (answered from the engine's current media), OPTIONS,
  *                   INFO, NOTIFY (200); anything unknown 405/501, never a crash
@@ -39,10 +40,14 @@ final class SipUserAgent {
         case registrationFailed(Failure)
         /// The socket is gone.
         case transportLost(String)
-        /// The INVITE left.
+        /// The INVITE left (the first one, and after a challenge the one with credentials).
         case inviteSent
-        /// Any reply to the INVITE — a provisional, or the challenge: the SBC has it.
+        /// A provisional reply (1xx) to the INVITE in flight: the SBC has it. Its first for each INVITE — after a
+        /// challenge, the INVITE with credentials' own 100 Trying, which the answer is timed from — then any new status.
         case heard(Int)
+        /// The INVITE was challenged (401 or 407) and has gone again with credentials: what was heard so far belonged
+        /// to an INVITE now refused, and the INVITE in flight has heard nothing yet. A challenge is never `heard`.
+        case challenged(Int)
         /// The INVITE was answered (and the 2xx ACKed): the SBC's answer SDP, and its call id for the log.
         case answered(sdp: String, callSid: String?)
         case inviteFailed(Failure)
@@ -215,9 +220,13 @@ final class SipUserAgent {
     }
 
     /**
-     * The end, politely: withdraw the registration (it is challenged too) and
-     * close the socket once that is answered — or after `grace`, whatever
-     * happens. Anything already on its way (a BYE) has left first.
+     * The end, politely: withdraw the registration at once (it is challenged
+     * too) and close the socket once nothing on it waits for an answer — the
+     * un-REGISTER, a BYE, and a dial not yet answered, whose CANCEL earns a
+     * 487 or whose answer crossing the CANCEL is ACKed and BYEd here: without
+     * those the server's leg stays up, running an agent nobody hears. Or after
+     * `grace`, whatever happens — at least `DialRules.abandonedDialGrace`
+     * while a dial is unanswered. Anything already on its way has left first.
      */
     func shutDown(grace: Double = 2.0) {
         guard !closed, !shuttingDown else { return }
@@ -227,12 +236,31 @@ final class SipUserAgent {
         reconnectTimer?.cancel()
         sessionTimer?.cancel()
         regRefreshTimer?.cancel()
-        clock.after(grace) { [weak self] in self?.close() }
+        clock.after(inviteInFlight ? max(grace, DialRules.abandonedDialGrace) : grace) { [weak self] in self?.close() }
         if registered && isOpen {
             registered = false
             sendRegister(expires: 0)
-        } else if pending.isEmpty {
-            clock.after(0.2) { [weak self] in self?.close() }
+        }
+        closeWhenIdle(after: 0.2)
+    }
+
+    /// An INVITE of ours is on its way and has no final answer yet: hanging up must CANCEL it, on this socket.
+    var inviteInFlight: Bool {
+        guard let c = call else { return false }
+        return c.state == .calling || c.state == .proceeding
+    }
+
+    /// Shutting down, and nothing on the socket waits for an answer any more.
+    private var idleWhileShuttingDown: Bool {
+        shuttingDown && !closed && regTx == nil && pending.isEmpty && !inviteInFlight
+    }
+
+    /// Shutting down: close once nothing on the socket waits for an answer, `after` a moment for what was just sent.
+    private func closeWhenIdle(after delay: Double = 0.05) {
+        guard idleWhileShuttingDown else { return }
+        clock.after(delay) { [weak self] in
+            guard let self = self, self.idleWhileShuttingDown else { return }
+            self.close()
         }
     }
 
@@ -343,8 +371,8 @@ final class SipUserAgent {
 
     private func registerAnswered(_ response: SipMessage?, _ failure: Failure?, expires: Int) {
         if expires == 0 {
-            // The registration is withdrawn (or could not be): nothing else is coming on this socket.
-            if shuttingDown { clock.after(0.05) { [weak self] in self?.close() } }
+            // The registration is withdrawn (or could not be): the socket goes once nothing else on it waits.
+            closeWhenIdle()
             return
         }
         guard let response = response, let code = response.statusCode else {
@@ -475,21 +503,19 @@ final class SipUserAgent {
             // The transaction ACKs every non-2xx final answer, with the INVITE's branch.
             send(SipWriter.ackFailure(invite: c.request, responseTo: response.header("To") ?? ""))
             c.timer?.cancel()
-            if !c.heard {
-                c.heard = true
-                call = c
-                onEvent(.heard(code))
-            }
             if (code == 401 || code == 407), !c.challenged, !c.canceled,
                let authorization = answerChallenge(response, for: c.request) {
                 // The same INVITE again with credentials: CSeq + 1, a new branch, the same Call-ID, tag and SDP.
+                // It is a new INVITE, and it has heard nothing yet: what the refused one heard was not its reply.
                 var again = c.request
                 again.set("CSeq", "\(c.request.cseq + 1) INVITE")
                 again.set("Via", "SIP/2.0/WSS \(identity.viaHost);branch=\(random.branch())")
                 again.set(code == 401 ? "Authorization" : "Proxy-Authorization", authorization)
                 c.request = again
                 c.challenged = true
+                c.heard = false
                 call = c
+                onEvent(.challenged(code))
                 sendInvite()
                 return
             }
@@ -714,10 +740,13 @@ final class SipUserAgent {
         if let c = call, cseq.method == "INVITE", c.request.callId == message.callId,
            c.request.branch == branch || (dialog != nil && cseq.number == dialog?.inviteSeq) {
             inviteResponse(message, code: code)
+            // A dial let go while it shut down has its final answer now (its BYE, if it needs one, is on its way).
+            closeWhenIdle()
             return
         }
         if pending[branch] != nil {
             clientResponse(message, code: code, branch: branch)
+            closeWhenIdle()
         }
     }
 
@@ -827,6 +856,7 @@ private struct InviteTx {
     var state = State.calling
     var challenged = false
     var canceled = false
+    /// The INVITE in flight has had a provisional reply; a new one after a challenge starts unheard.
     var heard = false
     var timer: RtcTimer?
 

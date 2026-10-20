@@ -36,6 +36,7 @@ final class UaLog {
             case .transportLost: return "transportLost"
             case .inviteSent: return "inviteSent"
             case .heard(let code): return "heard(\(code))"
+            case .challenged(let code): return "challenged(\(code))"
             case .answered: return "answered"
             case .inviteFailed(let f): return "inviteFailed(\(f.code.map(String.init) ?? f.cause))"
             case .byeReceived: return "byeReceived"
@@ -201,7 +202,8 @@ final class UaHarness {
         #expect(answerAck.toTag == "cByBmmry4gpBj")
         #expect(answerAck.topViaBranch != second.topViaBranch, "a new branch")
         #expect(!answerAck.has("Route"))
-        #expect(h.log.names.prefix(5) == ["connected", "registered", "inviteSent", "heard(100)", "inviteSent"])
+        // The challenge is said and is not heard; the INVITE with credentials' own 100 Trying is — the answer follows it.
+        #expect(h.log.names.prefix(8) == ["connected", "registered", "inviteSent", "heard(100)", "challenged(401)", "inviteSent", "heard(100)", "answered"])
         h.run { $0.close() }
     }
 
@@ -518,6 +520,82 @@ final class HoldGate {
         rig.sockets.sip.last?.open()
         #expect(rig.sockets.sip.last?.sentMessages.first?.method == "REGISTER")
         #expect(!rig.log.names.contains("byeReceived"))
+    }
+
+    @Test func aChallengeIsNeverHeardTheInviteWithCredentialsOwnTryingIs() {
+        // This SBC answers inside the send, so "inviteSent" is told after the replies here: the replies' order is the point.
+        let rig = Rig()
+        rig.connectAndAnswer()                             // 100 and 401, then 100 and 200 to the INVITE with credentials
+        #expect(rig.log.names.filter { $0 != "inviteSent" } == ["connected", "registered", "heard(100)", "challenged(401)", "heard(100)", "answered"])
+        #expect(rig.log.names.filter { $0 == "inviteSent" }.count == 2)
+
+        let bare = Rig()
+        bare.sbc.sendTrying = false                        // the challenge with no 100 Trying before it
+        bare.sbc.inviteFinal = nil
+        bare.connectAndAnswer()
+        #expect(bare.log.has("challenged(401)"))
+        #expect(!bare.log.names.contains { $0.hasPrefix("heard") }, "a challenge counted as a reply")
+        let second = bare.sbc.received.last { $0.method == "INVITE" }!
+        bare.sockets.sip.last?.deliver(ScriptedSbc.reply(second, 100))
+        #expect(bare.log.names.last == "heard(100)")
+    }
+
+    @Test func aShutDownDialKeepsItsSocketUntilItsInviteHasItsFinalAnswer() {
+        let rig = Rig()
+        rig.sbc.inviteFinal = nil                          // 100 Trying, then nothing
+        rig.connectAndAnswer()
+        let invite = rig.sbc.received.last { $0.method == "INVITE" }!
+        let socket = rig.sockets.sip.last!
+        rig.ua.hangUp()
+        rig.ua.shutDown()
+        #expect(socket.sentMessages.filter { $0.method == "CANCEL" }.map(\.topViaBranch) == [invite.topViaBranch])
+        #expect(socket.sentMessages.last { $0.method == "REGISTER" }?.header("Expires") == "0", "the registration goes at once")
+        rig.clock.advance(3)
+        #expect(!socket.closedByClient, "the socket the dial's ending travels on went before it")
+        socket.deliver(ScriptedSbc.reply(invite, 487, toTag: "t487"))
+        #expect(socket.sentMessages.last?.method == "ACK", "the 487 is ACKed")
+        rig.clock.advance(0.1)
+        #expect(socket.closedByClient, "then the socket goes")
+    }
+
+    @Test func aShutDownDialAnsweredAcrossItsCancelIsAckedAndEndedBeforeTheSocketGoes() {
+        let rig = Rig()
+        rig.sbc.inviteFinal = nil
+        rig.connectAndAnswer()
+        let invite = rig.sbc.received.last { $0.method == "INVITE" }!
+        let socket = rig.sockets.sip.last!
+        rig.ua.hangUp()
+        rig.ua.shutDown()
+        rig.clock.advance(1)
+        socket.deliver(ScriptedSbc.answer(invite))         // crossing the CANCEL: the leg exists now
+        #expect(socket.sentMessages.suffix(2).map { $0.method ?? "reply" } == ["ACK", "BYE"])
+        #expect(socket.sentMessages.last?.requestUri == "sip:198.51.100.7:5060;transport=tcp")
+        rig.clock.advance(0.1)
+        #expect(socket.closedByClient, "the BYE answered, the socket goes")
+        #expect(!rig.log.has("answered"), "nobody is told about a call we let go")
+    }
+
+    @Test func aShutDownDialThatNeverHearsBackLetsItsSocketGoAfterTheGrace() {
+        let rig = Rig()
+        rig.sbc.inviteFinal = nil
+        rig.connectAndAnswer()
+        let socket = rig.sockets.sip.last!
+        rig.ua.hangUp()
+        rig.ua.shutDown(grace: 0.5)                        // a dial in flight holds it for its own grace, whatever is asked
+        rig.clock.advance(DialRules.abandonedDialGrace - 0.1)
+        #expect(!socket.closedByClient)
+        rig.clock.advance(0.2)
+        #expect(socket.closedByClient)
+    }
+
+    @Test func aShutDownWithNoDialClosesOnceTheRegistrationIsWithdrawn() {
+        let rig = Rig()
+        rig.ua.start()
+        rig.sockets.sip.last?.open()
+        #expect(rig.log.has("registered"))
+        rig.ua.shutDown()
+        rig.clock.advance(0.1)
+        #expect(rig.sockets.sip.last?.closedByClient == true, "nothing to wait for: it goes at once")
     }
 
     @Test func requestsInsideTheDialogAreAnswered() {

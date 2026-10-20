@@ -126,13 +126,17 @@ final class RtcCallEngine: GraineRtcCall {
     private var muted = false
     private var dials = 0
     private var dialSeq = 0
+    /// The INVITE in flight has had a reply: a provisional one, or its answer. A challenge is not one — it replaces the INVITE.
     private var heard = false
     private var heardArmed = false
     private var redialing = false
     private var freshConnections = 0
     private var budgetTimer: RtcTimer?
     private var heardTimer: RtcTimer?
+    /// The ceiling: `DialRules.answerDeadline` from the dial, whatever it heard.
     private var answerTimer: RtcTimer?
+    /// `DialRules.answerAfterHeard` from the first provisional reply to the INVITE in flight; stopped by a challenge.
+    private var answerClock: RtcTimer?
     private var iceTimer: RtcTimer?
     private var iceState = RtcIceState.new
     private var dropBegan: Double?
@@ -487,6 +491,7 @@ final class RtcCallEngine: GraineRtcCall {
             mark("invite")
             lastInviteAt = clock.now
             let seq = dialSeq
+            // Silence is judged on the INVITE in flight when the deadline comes: after a challenge, the one with credentials.
             heardTimer = clock.after(DialRules.heardDeadline(registerSeconds: registerSeconds)) { [weak self] in
                 guard let self = self, seq == self.dialSeq, self.phase == .dialing, !self.heard else { return }
                 self.dialFailed(cause: "no_response", code: nil)
@@ -494,25 +499,38 @@ final class RtcCallEngine: GraineRtcCall {
 
         case .heard(let code):
             guard phase == .dialing else { return }
-            if !heard {
-                mark("heard")
-                // The SBC has it: still only "trying" after DialRules.answerAfterHeard is a stuck dial, cancelled
-                // and dialled once more on a fresh connection while the attempt's budget still has room.
+            if !heard { mark("heard") }
+            heard = true
+            trace("dial: \(code)")
+            // THE ANSWER CLOCK. The SBC has the INVITE in flight: still only "trying" DialRules.answerAfterHeard after
+            // its first provisional reply is a stuck dial, cancelled and dialled once more on a fresh connection while
+            // the attempt's budget still has room. Started once per INVITE — `.challenged` stops it, and the INVITE
+            // with credentials starts it again from its own reply. An answer that has arrived is never stuck:
+            // `.answered` comes as the 200 is read, before its SDP is applied, and stops it.
+            if answerClock == nil {
                 let seq = dialSeq
-                answerTimer?.cancel()
-                answerTimer = clock.after(DialRules.answerAfterHeard) { [weak self] in
+                answerClock = clock.after(DialRules.answerAfterHeard) { [weak self] in
                     guard let self = self, seq == self.dialSeq, self.phase == .dialing else { return }
+                    self.answerClock = nil
                     self.dialFailed(cause: "no_answer", code: nil)
                 }
             }
-            heard = true
-            heardTimer?.cancel()
-            trace("dial: \(code)")
+
+        case .challenged(let code):
+            guard phase == .dialing else { return }
+            // Refused for its credentials and sent again with them: nothing heard so far was the INVITE now in flight.
+            let after = Int(((clock.now - (lastInviteAt ?? clock.now)) * 1000).rounded())
+            trace("dial: challenged (\(code)) after \(after) ms — sent again with credentials, the answer timed from its own reply")
+            heard = false
+            answerClock?.cancel()
+            answerClock = nil
 
         case let .answered(sdp, callSid):
             guard phase == .dialing, let media = media else { return }
             heardTimer?.cancel()
             answerTimer?.cancel()
+            answerClock?.cancel()
+            answerClock = nil
             phase = .answered
             mark("answered")
             trace("answered in \(ms(since: "invite")) ms\(callSid.map { " (call \($0))" } ?? "")")
@@ -609,6 +627,8 @@ final class RtcCallEngine: GraineRtcCall {
         guard phase == .dialing else { return }
         heardTimer?.cancel()
         answerTimer?.cancel()
+        answerClock?.cancel()
+        answerClock = nil
         let why = Self.describe(cause: cause, code: code)
         switch DialRules.verdict(cause: cause, code: code, dialsSoFar: dials) {
         case .ignore:
@@ -634,6 +654,8 @@ final class RtcCallEngine: GraineRtcCall {
         let old = ua
         ua = nil
         uaGeneration += 1
+        // A dial given up on is CANCELled — an answer crossing the CANCEL is ACKed and BYEd — on its own socket, which
+        // stays until that dial has ended (SipUserAgent.shutDown): a leg left up on the server runs a second agent.
         old?.hangUp()
         old?.shutDown(grace: 0.5)
         redialing = true
@@ -847,7 +869,7 @@ final class RtcCallEngine: GraineRtcCall {
 
     private func release(sendBye: Bool) {
         phase = .ended
-        for timer in [budgetTimer, heardTimer, answerTimer, iceTimer, registerTimer, levelTimer] { timer?.cancel() }
+        for timer in [budgetTimer, heardTimer, answerTimer, answerClock, iceTimer, registerTimer, levelTimer] { timer?.cancel() }
         for timer in dropTimers { timer.cancel() }
         dropTimers = []
         if sendBye { ua?.hangUp() }
