@@ -11,8 +11,8 @@ import Foundation
  *             hand, else on the web route; then, side by side, the peer
  *             gathering its candidates and the SIP socket registering
  *   begin     the control channel opens (the server holds it until the call
- *             exists) and the attempt's budget starts: 12 s to media, or the
- *             call is the WebSocket's
+ *             exists) and, once the mint has answered, the attempt's budget
+ *             starts: 12 s to media, or the call is the WebSocket's
  *   audio     CallKit activated the session (or, failing that, it was started
  *             directly): only now does the INVITE leave, so the greeting is
  *             never played into a session that is not running
@@ -68,6 +68,8 @@ final class RtcCallEngine: GraineRtcCall {
     static let quietSeconds = 0.5
     /// Five readings a second.
     static let levelSeconds = 0.2
+    /// The audio so far goes up to the SDK about this often (GraineRtcEvent.audio).
+    static let audioReportSeconds = 1.0
     /// A media path lost this long is restarted, once.
     static let restartAfter = 3.0
     /// Lost this long with no restart possible: dropped (the voice bar's rule).
@@ -113,7 +115,11 @@ final class RtcCallEngine: GraineRtcCall {
     private var sipLostAt: Double?
     private var restartedAt: Double?
     private var qualitySent = false
+    /// The `ended` row went: once per call.
+    private var endedSent = false
     private var quality = RtcQualitySamples()
+    /// When the audio so far last went up to the SDK.
+    private var audioReportedAt: Double?
     private var media: RtcMedia?
     private var offer: String?
     private var ua: SipUserAgent?
@@ -240,9 +246,16 @@ final class RtcCallEngine: GraineRtcCall {
             // Set up and registered before the tap — a prepared call's connect row says so.
             readyAtTap = phase == .ready && !redialing
             control?.open()
-            budgetTimer = clock.after(request.budgetSeconds) { [weak self] in self?.budgetSpent() }
+            // The attempt's budget runs from the mint's answer: a slow mint is the web's wait, not WebRTC's.
+            if credential != nil { armBudget() }
             dialIfReady()
         }
+    }
+
+    /// WebRTC's budget — mint to media — once the call is wanted and its credential is in hand; once per call.
+    private func armBudget() {
+        guard begun, budgetTimer == nil, phase < .live else { return }
+        budgetTimer = clock.after(request.budgetSeconds) { [weak self] in self?.budgetSpent() }
     }
 
     func audioActivated() {
@@ -289,13 +302,23 @@ final class RtcCallEngine: GraineRtcCall {
         clock.run { [self] in control?.send(frame, kind: kind) }
     }
 
+    func sendEnded(cause: String) {
+        clock.run { [self] in
+            guard phase != .ended else { return }
+            // As Android's leg: the call's quality row, then how it ended — both before the BYE.
+            if phase == .live { sendQualityRow() }
+            sendEndedRow(cause)
+        }
+    }
+
     func hangUp() {
         clock.run { [self] in
             guard phase != .ended else { return }
+            // Nothing is reported after a hang-up, not even to the log: the caller has moved on (its connection report
+            // keeps the audio it was last handed).
+            silence()
             // The call's quality row goes before the BYE, on the channel still open; best effort, never waited for.
             if phase == .live { sendQualityRow() }
-            // Nothing is reported after a hang-up, not even to the log: the caller has moved on.
-            silence()
             release(sendBye: true)
         }
     }
@@ -371,6 +394,7 @@ final class RtcCallEngine: GraineRtcCall {
         mark("minted")
         trace("minted\(place.map { " at \($0)" } ?? "") in \(ms(since: "mint_sent")) ms (\(credential.iceServers.count) ICE server(s))")
         self.credential = credential
+        armBudget()
         if media == nil { startMedia(credential) }
         connectSip(credential)
     }
@@ -813,6 +837,7 @@ final class RtcCallEngine: GraineRtcCall {
         quality.add(stats)
         // The agent's voice as the receiver plays it out, for the call screen's visualiser (smoothed by the SDK).
         emit(.level(stats.audioLevel.isFinite ? max(0, min(1, stats.audioLevel)) : 0))
+        reportAudio()
         if stats.audioLevel >= Self.speakingLevel {
             if marks["first_voice"] == nil {
                 mark("first_voice")
@@ -855,8 +880,9 @@ final class RtcCallEngine: GraineRtcCall {
     private func end(_ ending: GraineRtcEnding) {
         guard phase == .live else { return }
         if case .dropped(let why) = ending { trace("dropped: \(why)") }
-        // Their BYE (or the path lost): the quality row at once, while the channel may still be open.
+        // Their BYE (or the path lost): the quality row at once, while the channel may still be open, then who ended it.
         sendQualityRow()
+        sendEndedRow(ending == .remote ? "remote_bye" : "media_drop")
         release(sendBye: ending != .remote)
         if speaking {
             speaking = false
@@ -890,16 +916,43 @@ final class RtcCallEngine: GraineRtcCall {
     /**
      * THE CALL'S ANALYTICS ROWS (GraineCallTelemetry, contract v1), on its own
      * control channel: it keeps them until it joins and drops them if it never
-     * does, so a row never delays the call or its hang-up. Durations in whole
-     * milliseconds, measured on the call's clock; never an id or an identity.
+     * does, so a row never delays the call or its hang-up. Each also goes up
+     * to the SDK as it is made (GraineRtcEvent.row): the call's connection
+     * report, live. Durations in whole milliseconds, measured on the call's
+     * clock; never an id or an identity.
      */
     private func sendRow(_ name: String, _ data: [String: Any?]) {
         guard let frame = GraineCallTelemetry.frame(name, data) else { return }
+        sendRow(frame)
+    }
+
+    /// A row on the channel — and up to the SDK, which reads the call's connection report from its rows.
+    private func sendRow(_ frame: String) {
         control?.send(frame, kind: nil)
+        emit(.row(frame))
     }
 
     private func span(_ from: Double?, _ to: Double?) -> Int? {
         GraineCallTelemetry.milliseconds(from: from, to: to)
+    }
+
+    /**
+     * HOW THE CALL ENDED, once, for a call that was dialled — as Android's
+     * leg says it: who or what ended it, how long the call had its audio
+     * (from media, once it had it) and whether the agent's voice was heard;
+     * on the control channel before the BYE, or at the far side's while the
+     * channel may still be open, and up to the SDK.
+     */
+    private func sendEndedRow(_ cause: String) {
+        guard begun, !endedSent else { return }
+        endedSent = true
+        guard let frame = GraineCallTelemetry.endedFrame(
+            cause: cause,
+            transport: "rtc",
+            afterMs: phase == .live ? span(marks["connected"], clock.now) : nil,
+            voiceHeard: marks["first_voice"] != nil
+        ) else { return }
+        sendRow(frame)
     }
 
     /**
@@ -910,7 +963,7 @@ final class RtcCallEngine: GraineRtcCall {
      * and its age at the tap is said. Cold, they are inside setup.
      */
     private func sendConnectRow() {
-        if let row = transportRow { control?.send(row, kind: nil) }
+        if let row = transportRow { sendRow(row) }
         let prepared = preparedAhead && readyAtTap
         let tap = marks["begin"] ?? startedAt
         let answered = marks["answered"] ?? clock.now
@@ -949,6 +1002,18 @@ final class RtcCallEngine: GraineRtcCall {
     /// Each time the connection heals: what healed it, and how long the trouble lasted.
     private func sendRecoveryRow(_ what: String, since: Double) {
         sendRow("recovery", ["what": what, "after_ms": span(since, clock.now)])
+    }
+
+    /**
+     * The audio as received so far — the running figures the quality row will
+     * carry — up to the SDK about once a second while the call is live, for
+     * its connection report. Never on the channel: the quality row says it
+     * there, once, at the end.
+     */
+    private func reportAudio() {
+        if let last = audioReportedAt, clock.now - last < Self.audioReportSeconds { return }
+        audioReportedAt = clock.now
+        emit(.audio(lossPct: quality.lossPercent, jitterAvgMs: quality.jitterAverageMs, jitterMaxMs: quality.jitterMaxMs, rttAvgMs: quality.roundTripAverageMs))
     }
 
     /// At the end of a call that had media, once, best effort: how long, and how the audio fared.

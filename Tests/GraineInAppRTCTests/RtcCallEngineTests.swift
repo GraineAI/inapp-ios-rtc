@@ -98,7 +98,7 @@ final class EngineRig {
             case .connected: return "connected"
             case .speaking(let on): return "speaking(\(on))"
             case .reconnecting(let on): return "reconnecting(\(on))"
-            case .level: return nil
+            case .level, .row, .audio: return nil
             case .control: return "control"
             case let .unreachable(reason, _): return "unreachable(\(reason.rawValue))"
             case let .refused(code, _): return "refused(\(code))"
@@ -507,16 +507,32 @@ final class EngineRig {
         #expect(failing.invites.count == 4, "two dials, each challenged")
     }
 
-    @Test func theWholeAttemptHas12Seconds() {
+    /// 0.14.0: the 12 s run from the mint's answer — a slow mint is the web route's wait (its own request gives up at 10 s), not WebRTC's.
+    @Test func theWholeAttemptHas12SecondsFromTheMintsAnswer() {
         let rig = EngineRig()
         rig.minting.hold = true
         rig.ready()
-        rig.clock.advance(11.9)
-        #expect(rig.names.isEmpty)
-        rig.clock.advance(0.2)
-        #expect(rig.names == ["unreachable(mint_failed)"])
+        rig.clock.advance(20)
+        #expect(rig.names.isEmpty, "the mint still on its way: no budget spent yet")
         rig.minting.release()
-        #expect(rig.names == ["unreachable(mint_failed)"], "a late answer changes nothing")
+        rig.openSip()
+        #expect(rig.names == ["ready"])
+        rig.clock.advance(11.9)
+        #expect(rig.names == ["ready"], "CallKit has not handed the audio over: nothing dialled, the budget still running")
+        rig.clock.advance(0.2)
+        #expect(rig.names == ["ready", "unreachable(error)"], "12 s after the mint answered, not 12 s after the tap")
+    }
+
+    @Test func aCallPreparedBeforeTheTapHasItsBudgetFromTheTap() {
+        let rig = EngineRig()
+        rig.engine.prepare()
+        rig.openSip()
+        rig.clock.advance(30)                   // minted and ready long before the tap
+        rig.engine.begin()
+        rig.clock.advance(11.9)
+        #expect(rig.names == ["ready"])
+        rig.clock.advance(0.2)
+        #expect(rig.names == ["ready", "unreachable(error)"])
     }
 
     @Test func withoutCallKitTheAudioIsStartedDirectlyThenTheCallDials() {

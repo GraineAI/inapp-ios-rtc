@@ -57,7 +57,7 @@ import Testing
         #expect((direct.json?["variables"] as? [String: Any])?["call_reason"] as? String == "card_blocked")
         #expect(direct.json?["identity"] == nil && direct.json?["publishableKey"] == nil && direct.json?["callId"] == nil,
                 "who the customer is, and which call, ride in the grant")
-        #expect(direct.timeout == 4)
+        #expect(direct.timeout == 1.5, "a dead direct route hands the call to the web route fast")
         #expect(rig.names == ["ready"])
         #expect(rig.lines.contains { $0.hasPrefix("rtc: minted at the gateway in") })
     }
@@ -282,14 +282,14 @@ import Testing
         #expect(d.mint.restReason == nil, "one is not two")
     }
 
-    @Test func aDirectMintWithoutAnAnswerIn4SecondsIsAbandoned() {
+    @Test func aDirectMintWithoutAnAnswerIn1Point5SecondsIsAbandoned() {
         let d = DirectRig()
         d.warm()
         d.gateway.holding = [.direct]
         let rig = d.place()
         rig.ready()
         #expect(rig.minting.requests.isEmpty)
-        d.clock.advance(3.9)
+        d.clock.advance(1.4)
         #expect(rig.minting.requests.isEmpty, "still the gateway's turn")
         d.clock.advance(0.2)
         #expect(rig.minting.requests.count == 1, "the web route")
@@ -297,7 +297,7 @@ import Testing
         #expect(rig.names == ["ready"])
         d.gateway.release(.direct)
         #expect(rig.names == ["ready"], "a late answer changes nothing")
-        #expect(rig.lines.contains { $0.contains("the gateway did not answer (timed out after 4 s)") })
+        #expect(rig.lines.contains { $0.contains("the gateway did not answer (timed out after 1.5 s)") })
     }
 
     // MARK: Resting
@@ -599,15 +599,17 @@ import Testing
 
     // MARK: Is the gateway there
 
-    @Test func aProbeOnItsWayIsWaitedFor() {
+    /// 0.14.0: the call is dialling — a probe still on its way is not waited for (it once held a call up to 5 s).
+    @Test func aProbeOnItsWayIsNotWaitedFor() {
         let d = DirectRig()
         d.gateway.holding = [.probe]
         d.warm()
         let rig = d.place()
         rig.engine.prepare()
-        #expect(rig.minting.requests.isEmpty && d.gateway.directs.isEmpty, "waiting for the gateway's answer")
+        #expect(d.gateway.directs.count == 1, "the call's mint goes at once, on a connection of its own")
+        #expect(rig.minting.requests.isEmpty, "and the gateway answers it")
         d.gateway.release(.probe)
-        #expect(d.gateway.directs.count == 1, "it said yes: the mint rides its connection")
+        #expect(d.gateway.directs.count == 1, "the probe's answer asks nothing more of anyone")
         rig.openSip()
         rig.engine.begin()
         #expect(rig.minting.requests.isEmpty)

@@ -294,6 +294,99 @@ private let transportRow = GraineCallTelemetry.frame("transport", ["transport": 
         #expect(rows(notJoined).isEmpty, "a channel that never joined sends nothing")
     }
 
+    // MARK: - who ended it (0.14.0)
+
+    @Test func theirByeAndALostLineSayWhoEndedTheCallAfterTheQualityRow() throws {
+        let rig = EngineRig()
+        rig.live()
+        join(rig)
+        rig.clock.advance(2)
+        rig.theirBye()
+        #expect(rig.names.last == "ended(remote)")
+        #expect(rows(rig).suffix(2).map(\.name) == ["quality", "ended"], "the quality row, then who ended it, before the channel closes")
+        #expect(rows(rig).last?.text == #"{"type":"app_event","event":{"name":"ended","detail":"the far side hung up after 2.0s, the agent not heard","quiet":true,"telemetry":true,"data":{"cause":"remote_bye","transport":"rtc","after_ms":2000,"voice_heard":false}}}"#)
+
+        let dropped = EngineRig()
+        dropped.live()
+        join(dropped)
+        dropped.media.ice(.disconnected)
+        dropped.clock.advance(10.1)
+        #expect(dropped.names.last == "ended(dropped)")
+        #expect(rows(dropped).last?.detail.hasPrefix("the audio path dropped after ") == true)
+        #expect(rows(dropped).last?.data["cause"] as? String == "media_drop")
+
+        let ours = EngineRig()
+        ours.live()
+        join(ours)
+        ours.engine.hangUp()
+        #expect(!rows(ours).contains { $0.name == "ended" }, "a hang-up of ours: the SDK says why itself, before it hangs up")
+    }
+
+    /// As Android's leg (CallAnalyticsRowsTest): our end says who ended it after the quality row, before the BYE, once.
+    @Test func ourEndSaysWhoEndedItAfterTheQualityRowOnce() throws {
+        let rig = EngineRig()
+        rig.live()
+        join(rig)
+        rig.clock.advance(3)
+        rig.engine.sendEnded(cause: "local_end")
+        rig.engine.hangUp()
+        #expect(rows(rig).suffix(2).map(\.name) == ["quality", "ended"])
+        #expect(rows(rig).last?.text == #"{"type":"app_event","event":{"name":"ended","detail":"hung up on this side after 3.0s, the agent not heard","quiet":true,"telemetry":true,"data":{"cause":"local_end","transport":"rtc","after_ms":3000,"voice_heard":false}}}"#)
+        #expect(rows(rig).filter { $0.name == "ended" }.count == 1 && rows(rig).filter { $0.name == "quality" }.count == 1, "once each")
+
+        // Never dialled: nothing to say.
+        let prepared = EngineRig()
+        prepared.engine.prepare()
+        prepared.engine.sendEnded(cause: "local_end")
+        #expect(!rows(prepared).contains { $0.name == "ended" })
+    }
+
+    // MARK: - the SDK's copy: the call's connection report (0.14.0)
+
+    @Test func everyRowGoesUpToTheSdkAsItIsMadeEvenBeforeTheChannelJoins() throws {
+        let rig = EngineRig()
+        rig.engine.transportRow = transportRow
+        rig.live()
+        let up = rig.events.compactMap { event -> String? in if case .row(let frame) = event { return frame }; return nil }
+        #expect(up.count == 2 && up.first == transportRow, "the transport row its dialler wrote, then the connect row")
+        #expect(rig.sockets.control.first?.sent.isEmpty == true, "the channel still holds them")
+        join(rig)
+        #expect(rows(rig).map(\.text) == up, "exactly what the channel sent")
+        rig.media.level.audioLevel = 0.3
+        rig.media.level.packetsReceived = 10
+        rig.clock.advance(0.2)
+        let heard = rig.events.compactMap { event -> String? in if case .row(let frame) = event { return frame }; return nil }
+        #expect(heard == rows(rig).map(\.text), "the voice row as it was heard: sent and handed up")
+        rig.engine.hangUp()
+        let all = rig.events.compactMap { event -> String? in if case .row(let frame) = event { return frame }; return nil }
+        #expect(all == heard, "a hang-up reports nothing, not even its quality row — that goes on the channel only")
+        #expect(rows(rig).last?.name == "quality")
+    }
+
+    @Test func theAudioSoFarGoesUpAboutOnceASecondWhileLive() throws {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.level.packetsReceived = 997
+        rig.media.level.packetsLost = 3
+        rig.media.level.jitter = 0.012
+        rig.media.level.roundTrip = 0.048
+        rig.clock.advance(3)
+        let audio = rig.events.compactMap { event -> [Double?]? in
+            if case let .audio(loss, jitterAvg, jitterMax, rtt) = event { return [loss, jitterAvg, jitterMax, rtt] }
+            return nil
+        }
+        #expect((2...4).contains(audio.count), "about once a second, not five times: \(audio.count)")
+        let last = try #require(audio.last)
+        #expect(last[0].map { abs($0 - 0.3) < 1e-9 } == true, "3 lost of 1 000")
+        #expect(last[1].map { abs($0 - 12) < 1e-9 } == true && last[2].map { abs($0 - 12) < 1e-9 } == true)
+        #expect(last[3].map { abs($0 - 48) < 1e-9 } == true)
+        #expect(rig.sockets.control.flatMap(\.sent).allSatisfy { !$0.contains(#""name":"quality""#) }, "never on the channel while the call goes")
+        let before = EngineRig()
+        before.ready()
+        before.clock.advance(3)
+        #expect(!before.events.contains { if case .audio = $0 { return true }; return false }, "nothing before the media flows")
+    }
+
     // MARK: - the channel, ids, keys
 
     @Test func aChannelThatNeverJoinsDropsEveryRow() throws {

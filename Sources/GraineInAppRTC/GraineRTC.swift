@@ -48,4 +48,11 @@ final class GraineInAppRTCModule: NSObject, GraineRtcModule {
     func nextCallId(_ request: GraineRtcRequest) -> String? {
         RtcDirectMint.shared.takeCallId(baseUrl: request.baseUrl, body: request.mintBody(""))
     }
+
+    /// CallKit took the audio session back after its call was over: WebRTC's view of the session follows (Engine/RtcAudioGate.swift).
+    func audioSessionDeactivated() {
+        #if os(iOS)
+        RtcAudioGate.shared.sessionDeactivated()
+        #endif
+    }
 }

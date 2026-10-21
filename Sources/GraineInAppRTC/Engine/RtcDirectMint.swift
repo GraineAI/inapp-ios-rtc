@@ -36,7 +36,7 @@ import Foundation
  *            that id is asked for as it rings (`warm` with a body naming it),
  *            and again when who the customer is changes while it rings
  *   mint     a usable grant for exactly this call and a gateway that said
- *            yes: the credential from the gateway within 4 s, else the web
+ *            yes: the credential from the gateway within 1.5 s, else the web
  *            route — whose answer's grant is kept for that call's own redials
  *
  * EVERYTHING HERE IS OPTIONAL. A direct mint answers a credential, a gate's
@@ -149,8 +149,13 @@ final class RtcDirectMint {
         http: URLSessionRtcHTTP()
     )
 
-    /// A direct mint answers in ~0.2 s from India; one that has not answered in four is not about to, and the web route is still there.
+    /// The gateway's probe answers in ~0.2 s from India; one that has not answered in four is not about to.
     static let timeout = 4.0
+    /**
+     * A call's direct mint is on the way to its first word: one that has not
+     * answered in 1.5 s is a dead route, and the web route is still there.
+     */
+    static let mintTimeout = 1.5
     /// A grant request crosses the ocean to the web route, in the background.
     static let refreshTimeout = 10.0
     /// A grant with less life left than this is not used: the gateway allows 30 s of clock disagreement.
@@ -217,8 +222,6 @@ final class RtcDirectMint {
     private var probes: [String: Probe] = [:]
     /// Every direct route an offer has named: what is asked again when a rest is over.
     private var routes: [String: URL] = [:]
-    /// Mints waiting for a probe already on its way: nil for "ready", else why not.
-    private var probeWaiters: [String: [(String?) -> Void]] = [:]
     private var failures = 0
     private var refusedGrants = 0
     /// While the direct mint rests: until when (wall clock), and why.
@@ -349,21 +352,16 @@ final class RtcDirectMint {
         let offer = h.offer
         let route = offer.url.absoluteString
         switch probes[route] {
-        case .ready?:
+        case .ready?, .probing?:
+            // A probe still on its way is not waited for: the call is dialling. Its mint rides a connection of its
+            // own, and a route that does not answer in `mintTimeout` hands the call to the web route.
             break
-        case .probing?:
-            // A probe on its way is waited for, as in the voice bar: it opens the connection this mint rides.
-            probeWaiters[route, default: []].append { [self] notReady in
-                if let why = notReady { return finish(.webRoute(why)) }
-                attempt(baseUrl: baseUrl, body: body, done: done)
-            }
-            return
         case nil:
             // Its answer never came: asked again now, behind this call, which does not wait for it.
             probe(offer.url, log: nil)
             return finish(.webRoute("the gateway has not said whether it takes grants"))
         }
-        request(offer.url, json: parts.directBody(grant: offer.grant), timeout: Self.timeout) { [self] answer in
+        request(offer.url, json: parts.directBody(grant: offer.grant), timeout: Self.mintTimeout) { [self] answer in
             answered(answer, key: key, offer: offer, done: finish)
         }
     }
@@ -518,16 +516,14 @@ final class RtcDirectMint {
         guard probes[route] == nil, restingNow() == nil else { return }
         probes[route] = .probing
         request(url, json: nil, timeout: Self.timeout) { [self] answer in
-            var notReady: String?
             switch answer {
             case let .answered(status, data, _):
                 let object = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
                 if status == 200, DirectJSON.isTrue(object?["direct"]) {
                     // Yes — kept before the rest is looked at, so a rest ending now does not ask this route twice.
                     probes[route] = .ready
-                    if let why = restingNow() {
+                    if restingNow() != nil {
                         probes[route] = nil
-                        notReady = "resting (\(why))"
                     } else {
                         failures = 0
                         log?("direct mint: the gateway takes grants")
@@ -535,16 +531,13 @@ final class RtcDirectMint {
                 } else {
                     // Not here (yet): the web route alone for a while, then asked again.
                     probes[route] = nil
-                    notReady = "the gateway takes no grants (\(status))"
                     rest("the gateway takes no grants (\(status))", log: log)
                 }
             case .failed(let why):
                 probes[route] = nil
-                notReady = "the gateway did not answer (\(why))"
                 log?("direct mint: the gateway did not answer (\(why))")
                 failed(log: log)
             }
-            for wake in probeWaiters.removeValue(forKey: route) ?? [] { wake(notReady) }
         }
     }
 
@@ -607,7 +600,9 @@ final class RtcDirectMint {
         let deadline = clock.after(timeout) {
             guard !settled else { return }
             settled = true
-            done(.failed("timed out after \(Int(timeout)) s"))
+            // 4 s, 1.5 s: whole seconds without their ".0".
+            let shown = timeout == timeout.rounded() ? "\(Int(timeout))" : "\(timeout)"
+            done(.failed("timed out after \(shown) s"))
         }
         http.send(url, json: json, timeout: timeout) { [weak self] answer in
             self?.clock.run {
