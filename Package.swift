@@ -15,7 +15,7 @@ import PackageDescription
 // GraineInApp, of exactly the same version (the two talk through its SPI): this
 // repository's own ../ios while it is developed; publish-sdk-repo.sh writes the
 // released package's URL and version here in the export.
-let core: Package.Dependency = .package(url: "https://github.com/GraineAI/inapp-ios.git", exact: "0.14.1")
+let core: Package.Dependency = .package(url: "https://github.com/GraineAI/inapp-ios.git", exact: "0.14.3")
 let corePackage = "inapp-ios"
 
 let package = Package(

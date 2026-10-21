@@ -14,8 +14,8 @@ In Xcode: **File → Add Package Dependencies…**, enter
 library to the target that uses `GraineInApp`. In a `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/GraineAI/inapp-ios", from: "0.14.1"),
-.package(url: "https://github.com/GraineAI/inapp-ios-rtc", from: "0.14.1")
+.package(url: "https://github.com/GraineAI/inapp-ios", from: "0.14.3"),
+.package(url: "https://github.com/GraineAI/inapp-ios-rtc", from: "0.14.3")
 ```
 
 Always the same version as GraineInApp. With CocoaPods: `pod 'GraineInAppRTC'`.
