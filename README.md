@@ -14,8 +14,8 @@ In Xcode: **File → Add Package Dependencies…**, enter
 library to the target that uses `GraineInApp`. In a `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/GraineAI/inapp-ios", from: "0.14.3"),
-.package(url: "https://github.com/GraineAI/inapp-ios-rtc", from: "0.14.3")
+.package(url: "https://github.com/GraineAI/inapp-ios", from: "0.14.4"),
+.package(url: "https://github.com/GraineAI/inapp-ios-rtc", from: "0.14.4")
 ```
 
 Always the same version as GraineInApp. With CocoaPods: `pod 'GraineInAppRTC'`.
@@ -42,6 +42,11 @@ GraineRTC.install()
   reason.
 - The agent sees the screen you describe, runs your actions and captions the
   call exactly as on the WebSocket.
+- A call carries your app's declaration and the customer's identity token
+  exactly as the WebSocket's would (see GraineInApp's "Secure your agent: your
+  app and your users"): under *Require a verified app* it waits briefly for the
+  app's proof, and an agent that refuses the app ends the call with that reason
+  rather than trying the WebSocket.
 
 Integration guide: https://www.graine.ai/docs/in-app/ios
 

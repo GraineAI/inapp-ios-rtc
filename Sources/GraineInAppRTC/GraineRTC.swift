@@ -41,7 +41,7 @@ final class GraineInAppRTCModule: NSObject, GraineRtcModule {
 
     /// A grant for the direct mint — the next call's, or a ringing call's — and the gateway asked whether it takes one (Engine/RtcDirectMint.swift).
     func warmUp(_ request: GraineRtcRequest, log: ((String) -> Void)?) {
-        RtcDirectMint.shared.warm(baseUrl: request.baseUrl, body: request.mintBody(""), log: log)
+        RtcDirectMint.shared.warm(baseUrl: request.baseUrl, body: request.mintBody(""), tokens: request.clientTokens, log: log, heard: request.mintAnswered)
     }
 
     /// The id the next call's grant was asked for, while it is usable: the call being placed takes it.

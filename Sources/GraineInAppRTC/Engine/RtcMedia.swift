@@ -30,6 +30,16 @@ struct RtcInboundAudio: Equatable {
     var clockRate: Int? = nil
     /// Our side of that path: "host", "srflx", "prflx" or "relay".
     var candidate: String? = nil
+    /**
+     * WHAT THE SPEAKER HAS TAKEN, whatever the audio says (the playout watch,
+     * RtcCallEngine): the receiver's `totalSamplesReceived`, counted only as
+     * the phone's playout pulls audio, and libwebrtc's own `media-playout`
+     * count of samples handed to the speaker. Nil where not reported.
+     */
+    var samplesReceived: Int? = nil
+    var playoutSamples: Int? = nil
+    /// False when the receiver reports nothing yet (no packet has arrived) and only the playout count is known.
+    var inbound = true
 
     /// "audio/PCMU/8000": the codec and its clock rate, for the voice row (which writes it the SDP way, "PCMU/8000").
     var codecName: String? {
@@ -40,6 +50,31 @@ struct RtcInboundAudio: Equatable {
 
 struct RtcMediaError: Error, Equatable, CustomStringConvertible {
     var description: String
+}
+
+/// What the phone's audio route did while a call is live (RtcAudioControl.watchRoute).
+enum RtcAudioRouteEvent: Equatable {
+    /// The output moved — a headset or a car kit connected or left, the speaker toggled: the kind it is now.
+    case changed(String?)
+    /// The system interrupted the call's audio (Siri, an alarm)…
+    case interrupted
+    /// …and gave it back: the kind of output it plays from now.
+    case resumed(String?)
+}
+
+/// The kind of output an AVAudioSession port is, as an `audio` row says it — never a device's name.
+enum RtcAudioRoute {
+    static func kind(_ portType: String?) -> String? {
+        switch portType {
+        case "Speaker"?: return "speaker"
+        case "Receiver"?: return "receiver"
+        case "BluetoothHFP"?, "BluetoothA2DPOutput"?, "BluetoothLE"?: return "bluetooth"
+        case "Headphones"?, "USBAudio"?, "LineOut"?, "HDMIOutput"?: return "wired"
+        case "AirPlay"?: return "airplay"
+        case "CarAudio"?: return "car"
+        default: return nil
+        }
+    }
 }
 
 protocol RtcMedia: AnyObject {
@@ -61,6 +96,23 @@ protocol RtcMedia: AnyObject {
     /// The microphone's track on or off; capture keeps running.
     func setMuted(_ muted: Bool)
     func close()
+
+    // WEAK NETWORKS (RtcMediaRecovery, RtcResilience)
+
+    /// The link's pace (RtcPace): the relay wait of the next gathering grows with it while no UDP path has shown up.
+    var gatherPace: Double { get set }
+    /// What this peer has gathered since it was made (or since `forgetGathered`), by kind — server-reflexive ones included.
+    var gathered: RtcGathered { get }
+    /// The network changed: what was gathered says nothing about the new one.
+    func forgetGathered()
+    /// The connection's checks (candidate pairs, the transport's bytes and DTLS state); nil when they cannot be read.
+    func iceStats(_ done: @escaping (RtcIceReading?) -> Void)
+    /**
+     * Gather on these servers from the next offer on — with `relayOnly`, only
+     * through relays (the relays over TCP and TLS a UDP-blocking network
+     * leaves). False when the peer refused the change.
+     */
+    func useServers(_ servers: [RtcIceServer], relayOnly: Bool) -> Bool
 }
 
 /**
@@ -78,6 +130,20 @@ protocol RtcAudioControl: AnyObject {
     func startDirectly() -> Bool
     /// CallKit took the session back (a hold, an interruption).
     func deactivated()
+    /**
+     * Audio arrives and nothing plays (the playout watch): start the audio
+     * again from the top, activating the session here when it must. False
+     * when it would not start.
+     */
+    func restart() -> Bool
+    /// Why nothing plays, as far as the audio session can tell — an `audio` row's reason (`interrupted`, `unit_failed`, `disabled`, `inactive`) — or nil.
+    func stallCause() -> String?
+    /**
+     * Hear the phone's audio route while a call is live — an output that
+     * moves (a headset or car kit connecting or leaving, the speaker toggled),
+     * an interruption and its end — on any thread. Returns what stops it.
+     */
+    func watchRoute(_ heard: @escaping (RtcAudioRouteEvent) -> Void) -> () -> Void
     /// The call is over: the app's own audio settings back.
     func callEnds()
 }
@@ -88,5 +154,8 @@ final class NoAudioControl: RtcAudioControl {
     func activated() {}
     func startDirectly() -> Bool { true }
     func deactivated() {}
+    func restart() -> Bool { true }
+    func stallCause() -> String? { nil }
+    func watchRoute(_ heard: @escaping (RtcAudioRouteEvent) -> Void) -> () -> Void { {} }
     func callEnds() {}
 }

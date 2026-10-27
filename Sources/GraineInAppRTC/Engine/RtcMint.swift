@@ -3,8 +3,9 @@ import Foundation
 /*
  * THE CALL'S CREDENTIAL — `POST {baseUrl}/api/embed/rtc-session`, the request
  * the voice bar makes, with the same body the call's ticket would carry
- * (publishable key, the variables, who the customer is) and this call's
- * control-channel session id. The answer is a SIP credential worth one call
+ * (publishable key, the variables, who the customer is with their proof, the
+ * app's declaration — the core seals it) and this call's control-channel
+ * session id. The answer is a SIP credential worth one call
  * and a few minutes, the SBC to register with, the application to dial and
  * the ICE servers to reach it through. Every gate (credits, the agent being
  * on, the allowed domains) runs on that request; a refusal sends the call to
@@ -28,6 +29,8 @@ struct RtcCredential: Equatable {
     var expiresAt: Date?
     /// The grant the web route signed beside it (`direct`): this call's own, for its redials (Engine/RtcDirectMint.swift).
     var direct: RtcDirectOffer? = nil
+    /// What the answer said of the app and the user (`verification`, APP-IDENTITY.md §2.2), as JSON, for the core to keep.
+    var verification: Data? = nil
 
     /// Seconds of life left at `now`; infinite when unknown.
     func remaining(at now: Date) -> Double {
@@ -66,7 +69,8 @@ struct RtcCredential: Equatable {
             agentId: agent,
             iceServers: servers,
             expiresAt: text("expires_at").flatMap(Self.date),
-            direct: RtcDirectOffer.parse(object["direct"])
+            direct: RtcDirectOffer.parse(object["direct"]),
+            verification: (object["verification"] as? [String: Any]).flatMap { try? JSONSerialization.data(withJSONObject: $0) }
         )
     }
 

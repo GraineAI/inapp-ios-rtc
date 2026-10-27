@@ -244,6 +244,9 @@ final class SipUserAgent {
         closeWhenIdle(after: 0.2)
     }
 
+    /// A re-INVITE of ours (an ICE restart) is out and unanswered: another must wait for it.
+    var reinviteInFlight: Bool { ourReinviteOut }
+
     /// An INVITE of ours is on its way and has no final answer yet: hanging up must CANCEL it, on this socket.
     var inviteInFlight: Bool {
         guard let c = call else { return false }

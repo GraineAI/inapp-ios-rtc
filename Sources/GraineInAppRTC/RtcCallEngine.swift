@@ -17,15 +17,31 @@ import Foundation
  *             directly): only now does the INVITE leave, so the greeting is
  *             never played into a session that is not running
  *   dial      INVITE with X-Graine-Session-Id, X-Graine-Agent-Id and
- *             X-Application-Sid; no reply within the link's own pace, no
- *             answer within 15 s, or no media 8 s after the answer, and the
- *             dial has failed — a network-ish failure gets one more dial on a
- *             fresh connection, anything else goes to the WebSocket
- *   live      the media watched: a path lost for 3 s is restarted once (a
- *             re-INVITE with new ICE credentials); not back within 10 s, or
- *             lost for 8 s with no restart possible, and the call has dropped.
- *             While it is lost the call is `reconnecting` (the call screen's
- *             moment); the receiver's level is reported five times a second
+ *             X-Application-Sid; no reply within the link's own pace, or no
+ *             answer within 15 s, and the dial has failed — a network-ish
+ *             failure gets one more dial on a fresh connection (the link's own
+ *             failures, and a 491, a third), never into no network; anything
+ *             else goes to the WebSocket. UDP that looked blocked: the next
+ *             dial gathers only the relays over TCP and TLS
+ *   answered  the media path kept by RtcMediaRecovery: waited for 8 s × the
+ *             link's pace (longer while it is still making progress), then an
+ *             ICE restart inside the call — never a new call — and the
+ *             WebSocket only once that has failed, never before the deadline
+ *   live      the media watched (RtcMediaRecovery): a path lost is restarted
+ *             3 s in (at once on failed), never into no network — offline time
+ *             is not counted — and the call is dropped only after 15 s × pace
+ *             with a network, or 30 s without one. While it is lost the call is
+ *             `reconnecting` (the call screen's moment); the receiver's level
+ *             is reported five times a second
+ *   playout   the speaker watched too (`watchPlayout`): the audio activated
+ *             and the phone's playout running steadily (0.3 s), the control
+ *             channel hears {"type":"audio","state":"ready"} — the agent's
+ *             greeting waits for it, and it is said again when the audio
+ *             comes back after it was lost; audio arriving with nothing played for 2 s, the
+ *             phone's audio is started again, once; still nothing 3 s on,
+ *             and the call cannot be heard (`playoutFailed`). A route that
+ *             moves (a Bluetooth headset or car kit, the speaker) or an
+ *             interruption is given 4 s to settle before anything is judged
  *
  * Before any media: every failure is `unreachable` with the voice bar's
  * reason, and the SDK carries the call on the WebSocket inside the same
@@ -43,6 +59,8 @@ final class RtcCallEngine: GraineRtcCall {
         var now: () -> Date = Date.init
         /// The credential from the telephony gateway, with a grant (Engine/RtcDirectMint.swift); nil: the web route only.
         var direct: RtcDirectMint? = nil
+        /// Whether the phone has a network, and when that changes (Engine/RtcNetwork.swift).
+        var network: RtcNetwork = SteadyRtcNetwork()
 
         static func production() -> Parts {
             #if os(iOS)
@@ -57,7 +75,8 @@ final class RtcCallEngine: GraineRtcCall {
                 random: SystemSipRandom(),
                 makeMedia: { WebRTCMedia(clock: $0) },
                 audio: audio,
-                direct: RtcDirectMint.shared
+                direct: RtcDirectMint.shared,
+                network: PathRtcNetwork()
             )
         }
     }
@@ -70,12 +89,20 @@ final class RtcCallEngine: GraineRtcCall {
     static let levelSeconds = 0.2
     /// The audio so far goes up to the SDK about this often (GraineRtcEvent.audio).
     static let audioReportSeconds = 1.0
-    /// A media path lost this long is restarted, once.
-    static let restartAfter = 3.0
-    /// Lost this long with no restart possible: dropped (the voice bar's rule).
-    static let dropAfter = 8.0
-    /// Lost this long, restart or not: dropped.
-    static let restartDropAfter = 10.0
+    /// Audio arriving with nothing played this long: the phone's audio is started again, once.
+    static let playoutStallSeconds = 2.0
+    /**
+     * The audio is said ready (the agent's greeting waits for it) only once its playout has run this long, steadily,
+     * with the call's audio on. A deactivation that lands just after the audio started — the call before's, on a
+     * redial within a second — is seen before the greeting goes, not after it is cut.
+     */
+    static let readyStableSeconds = 0.3
+    /// Still nothing played this long after that restart: the call cannot be heard.
+    static let playoutFailAfter = 3.0
+    /// After the route moves (a Bluetooth headset or car kit's hands-free link can take seconds), nothing is judged this long.
+    static let routeSettleSeconds = 4.0
+    /// At most this many `route_changed` rows per call: a flapping headset says enough by then.
+    static let routeRowsMax = 8
 
     private enum Phase: Int, Comparable {
         case idle, preparing, ready, dialing, answered, live, ended
@@ -113,7 +140,6 @@ final class RtcCallEngine: GraineRtcCall {
     private var firstRegisterMs: Double?
     private var healing: (what: String, since: Double)?
     private var sipLostAt: Double?
-    private var restartedAt: Double?
     private var qualitySent = false
     /// The `ended` row went: once per call.
     private var endedSent = false
@@ -136,6 +162,8 @@ final class RtcCallEngine: GraineRtcCall {
     private var heard = false
     private var heardArmed = false
     private var redialing = false
+    /// The mint's refusal was cured once (APP-IDENTITY.md §2.3): a second one stands.
+    private var cureTried = false
     private var freshConnections = 0
     private var budgetTimer: RtcTimer?
     private var heardTimer: RtcTimer?
@@ -143,16 +171,58 @@ final class RtcCallEngine: GraineRtcCall {
     private var answerTimer: RtcTimer?
     /// `DialRules.answerAfterHeard` from the first provisional reply to the INVITE in flight; stopped by a challenge.
     private var answerClock: RtcTimer?
-    private var iceTimer: RtcTimer?
     private var iceState = RtcIceState.new
-    private var dropBegan: Double?
-    private var dropTimers: [RtcTimer] = []
-    private var restartTried = false
     private var levelTimer: RtcTimer?
+    // WEAK NETWORKS (RtcMediaRecovery, RtcResilience).
+    /// The answered dial's media path, kept inside WebRTC; nil before an answer and after the end.
+    private var recovery: RtcMediaRecovery?
+    /// When the current dial was answered: the budget never cuts a setup the recovery still works on before this + 30 s.
+    private var answeredAt: Double?
+    private var budgetArmedAt: Double?
+    /// The call's own media round trip (seconds), for the link's pace.
+    private var mediaRoundTrip: Double?
+    private var networkUnwatch: (() -> Void)?
+    /// A redial waiting for the network: woken by its return (true), a hang-up or its deadline (false).
+    private var networkWaiter: ((Bool) -> Void)?
+    private var networkWaitTimer: RtcTimer?
+    /// A restart's offer or re-INVITE is out: no second one until it settles.
+    private var restartOut = false
+    /// The peer gathers through the relays alone because THIS engine put it there: only that is ever lifted.
+    private var relayOnlyByUs = false
+    /// The next dial is made on the relays over TCP and TLS alone (this dial's UDP looked blocked); its offer is being made.
+    private var relayOnlyNextDial = false
+    private var offerStale = false
     private var speaking = false
     /// The live path was lost and is being brought back: what the call screen shows as "Reconnecting".
     private var reconnecting = false
     private var quietSince: Double?
+    /// How this call's audio was activated, for its `audio` rows: by CallKit, started directly, or not yet.
+    private var audioVia = "none"
+    /// The system took the audio back once the call was under way, and has not given it back: a direct start now is that deactivation's rescue.
+    private var deactivatedLive = false
+    // THE PLAYOUT WATCH (`watchPlayout`): the last reading's counters and when it was, how long audio has arrived with
+    // nothing played, the restart, and whether the audio was said ready — or the call said unheard.
+    private var lastPlayout: (samples: Int?, playout: Int?, packets: Int, at: Double)?
+    private var unplayedFor = 0.0
+    private var stillFor = 0.0
+    private var playoutRestartedAt: Double?
+    private var audioReady = false
+    private var playoutFailed = false
+    /// Since when the playout counts have moved in every reading with this call's audio on: the audio is said ready
+    /// only once that has lasted `readyStableSeconds`. Nil until they move, and again whenever they stop or the audio goes.
+    private var playingSince: Double?
+    /// When this call's audio last came on (CallKit, a direct start, a restart): a steady stretch never starts before it.
+    private var audioOnSince: Double?
+    /// Ready was said, then the audio was lost — taken back, or stalled and restarted: it is said again once it plays
+    /// steadily, with why (its `audio` row's reason). Nil otherwise.
+    private var readyAgainBecause: String?
+    // THE ROUTE (`routeEvent`): what stops hearing it, until when the watch stands aside, whether the system holds the
+    // audio, and the route rows said so far (and the last kind said).
+    private var routeUnwatch: (() -> Void)?
+    private var settleUntil: Double?
+    private var interrupted = false
+    private var routeRows = 0
+    private var lastRoute: String?
     /// Times of each step, for the log and the live test.
     private(set) var marks: [String: Double] = [:]
     private var startedAt: Double = 0
@@ -234,6 +304,8 @@ final class RtcCallEngine: GraineRtcCall {
                 self?.trace(joined ? "control: joined" : "control: lost")
             }
             control = channel
+            // The network, for the recovery's rules: changes hop onto the clock.
+            networkUnwatch = parts.network.watch { [weak self] online in self?.clock.run { self?.networkChanged(online) } }
             mint()
         }
     }
@@ -255,6 +327,7 @@ final class RtcCallEngine: GraineRtcCall {
     /// WebRTC's budget — mint to media — once the call is wanted and its credential is in hand; once per call.
     private func armBudget() {
         guard begun, budgetTimer == nil, phase < .live else { return }
+        budgetArmedAt = clock.now
         budgetTimer = clock.after(request.budgetSeconds) { [weak self] in self?.budgetSpent() }
     }
 
@@ -262,7 +335,9 @@ final class RtcCallEngine: GraineRtcCall {
         clock.run { [self] in
             guard phase != .ended else { return }
             parts.audio.activated()
-            audioOn = true
+            audioCameOn()
+            audioVia = "callkit"
+            deactivatedLive = false
             mark("audio")
             dialIfReady()
         }
@@ -274,9 +349,13 @@ final class RtcCallEngine: GraineRtcCall {
             if audioOn { return done(true) }
             let started = parts.audio.startDirectly()
             if started {
-                audioOn = true
+                audioCameOn()
                 mark("audio")
                 trace("audio: started without CallKit")
+                // CallKit never activated it — or took it back once the call was under way.
+                audioVia = "direct"
+                sendAudioRow("rescued", reason: deactivatedLive ? "deactivated" : "no_activation")
+                deactivatedLive = false
                 dialIfReady()
             }
             done(started)
@@ -288,7 +367,23 @@ final class RtcCallEngine: GraineRtcCall {
             guard phase != .ended else { return }
             parts.audio.deactivated()
             audioOn = false
+            playingSince = nil
+            // Once the call is under way: an interruption, not its end — the SDK starts the audio again if CallKit does not.
+            guard phase >= .dialing else { return }
+            deactivatedLive = true
+            // Said ready already: whatever played since may not have been heard — said again once it plays.
+            if audioReady { readyAgainBecause = "deactivated" }
+            sendAudioRow("deactivated_live", reason: nil)
         }
+    }
+
+    /// The call's audio is on — from now, when it was off: a steady stretch of playout is counted from here.
+    private func audioCameOn() {
+        if !audioOn {
+            audioOnSince = clock.now
+            playingSince = nil
+        }
+        audioOn = true
     }
 
     func setMuted(_ value: Bool) {
@@ -333,7 +428,22 @@ final class RtcCallEngine: GraineRtcCall {
      * before. Each failure of the direct mint costs one short request and
      * nothing else.
      */
+    /**
+     * What the call session needs first is made ready by the core
+     * (`beforeMint`: a proof of the app the agent requires, an identity token
+     * about to expire) — then the mint, with its body read only then.
+     */
     private func mint() {
+        guard let before = request.beforeMint else { return mintNow() }
+        before { [weak self] in
+            self?.clock.run {
+                guard let self = self, self.phase == .preparing || self.redialing else { return }
+                self.mintNow()
+            }
+        }
+    }
+
+    private func mintNow() {
         var base = request.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") { base.removeLast() }
         guard let url = URL(string: base + "/api/embed/rtc-session") else {
@@ -344,7 +454,7 @@ final class RtcCallEngine: GraineRtcCall {
         guard let direct = parts.direct else {
             return mintOnWebRoute(url, base: base, body: body)
         }
-        direct.mint(baseUrl: base, body: body) { [weak self] answer in
+        direct.mint(baseUrl: base, body: body, tokens: request.clientTokens) { [weak self] answer in
             self?.clock.run {
                 guard let self = self, self.phase == .preparing || self.redialing else { return }
                 switch answer {
@@ -358,9 +468,16 @@ final class RtcCallEngine: GraineRtcCall {
         }
     }
 
-    /// `POST {baseUrl}/api/embed/rtc-session`: every check on the way, and a grant back beside the credential.
+    /**
+     * `POST {baseUrl}/api/embed/rtc-session`: every check on the way, and a
+     * grant back beside the credential. With server tokens in play the body
+     * carries the agent's newest token, and a refusal a fresh one can lift is
+     * sent once more with it (GraineRtcTokens) — never in `body`, which is what
+     * the grant is kept for.
+     */
     private func mintOnWebRoute(_ url: URL, base: String, body: Data) {
-        parts.minting.mint(url, body: body) { [weak self] outcome in
+        let minting = parts.minting
+        let answered: (RtcMintOutcome) -> Void = { [weak self] outcome in
             self?.clock.run {
                 guard let self = self else { return }
                 if case .credential(let credential) = outcome {
@@ -369,18 +486,50 @@ final class RtcCallEngine: GraineRtcCall {
                         self.parts.direct?.accept(offer, baseUrl: base, body: body)
                     } else if self.request.rang {
                         // A call that rang, and its answer brought no grant: one asked for on its own, for a later mint of it.
-                        self.parts.direct?.warm(baseUrl: base, body: body)
+                        self.parts.direct?.warm(baseUrl: base, body: body, tokens: self.request.clientTokens)
                     }
                 }
                 self.minted(outcome, at: nil)
             }
         }
+        guard let tokens = request.clientTokens else { return minting.mint(url, body: body, done: answered) }
+        tokens.send(body, refreshable: { (outcome: RtcMintOutcome) in
+            guard case let .refused(_, code, _) = outcome else { return false }
+            return GraineRtcTokens.refreshable(code)
+        }, send: { json, answer in
+            minting.mint(url, body: json, done: answer)
+        }, done: answered)
     }
 
-    private func minted(_ outcome: RtcMintOutcome, at place: String?) {
+    private func minted(_ outcome: RtcMintOutcome, at place: String?, reported: Bool = false) {
         guard phase == .preparing || redialing else { return }
-        if case let .refused(_, code?, message) = outcome, GraineRtcRefusal.codes.contains(code) {
-            // A gate said no to the call itself: it ends here, in the gate's words — no fallback.
+        // What the call session said of the app and the user, for the core to keep (its passes, `verification`).
+        if !reported {
+            switch outcome {
+            case .credential(let credential):
+                request.mintAnswered?(200, credential.verification.map { Data(#"{"verification":"#.utf8) + $0 + Data("}".utf8) })
+            case let .refused(status, code, _):
+                request.mintAnswered?(status, code.flatMap { try? JSONSerialization.data(withJSONObject: ["code": $0]) })
+            case .unreachable:
+                break
+            }
+        }
+        if case let .refused(_, code?, _) = outcome, GraineRtcRefusal.curable.contains(code), !cureTried, let cure = request.cure {
+            // A refusal the core can cure — the app proven, a fresh identity token — and the mint made once more.
+            cureTried = true
+            trace("the call session asked for \(code): curing it once")
+            cure(code) { [weak self] retry in
+                self?.clock.run {
+                    guard let self = self, self.phase == .preparing || self.redialing else { return }
+                    if retry { return self.mintNow() }
+                    self.minted(outcome, at: place, reported: true)
+                }
+            }
+            return
+        }
+        if case let .refused(_, code?, message) = outcome, GraineRtcRefusal.ends(code) {
+            // A gate said no to the call itself, this app was refused, or the web route refused its server token or
+            // key: it ends here, in their words — no fallback (the WebSocket would meet the same answer).
             trace("refused by the call session: \(code)")
             release(sendBye: false)
             emit(.refused(code: code, message: message ?? ""))
@@ -533,7 +682,8 @@ final class RtcCallEngine: GraineRtcCall {
             // `.answered` comes as the 200 is read, before its SDP is applied, and stops it.
             if answerClock == nil {
                 let seq = dialSeq
-                answerClock = clock.after(DialRules.answerAfterHeard) { [weak self] in
+                // Exactly half a second on a good link; longer only on a link measured to be slow.
+                answerClock = clock.after(DialRules.answerAfterHeard(pace: pace())) { [weak self] in
                     guard let self = self, seq == self.dialSeq, self.phase == .dialing else { return }
                     self.answerClock = nil
                     self.dialFailed(cause: "no_answer", code: nil)
@@ -557,13 +707,15 @@ final class RtcCallEngine: GraineRtcCall {
             answerClock = nil
             phase = .answered
             mark("answered")
+            answeredAt = clock.now
             trace("answered in \(ms(since: "invite")) ms\(callSid.map { " (call \($0))" } ?? "")")
             // From here the BYE needs this socket: a lost one is reconnected, not abandoned.
             ua?.keepsTransport = true
-            iceTimer = clock.after(DialRules.iceConnectDeadline) { [weak self] in
-                guard let self = self, self.phase == .answered else { return }
-                self.giveUp(.iceTimeout, "the media path did not connect within \(Int(DialRules.iceConnectDeadline)) s of the answer", media: "ice_timeout")
-            }
+            // The media path is kept inside WebRTC first: waited for, restarted inside this call, then the WebSocket.
+            recovery?.dispose()
+            let kept = RtcMediaRecovery(host: self, clock: clock)
+            recovery = kept
+            kept.answered()
             media.applyAnswer(sdp) { [weak self] error in
                 guard let self = self, self.phase == .answered else { return }
                 if let error = error {
@@ -624,7 +776,7 @@ final class RtcCallEngine: GraineRtcCall {
     }
 
     private func dialIfReady() {
-        guard phase == .ready, begun, audioOn, !redialing, let offer = offer, let ua = ua, let credential = credential else { return }
+        guard phase == .ready, begun, audioOn, !redialing, !offerStale, let offer = offer, let ua = ua, let credential = credential else { return }
         phase = .dialing
         dials += 1
         dialSeq += 1
@@ -663,15 +815,22 @@ final class RtcCallEngine: GraineRtcCall {
             healing = ("redial", clock.now)
             dialSeq += 1
             phase = .ready
-            freshConnection(after: why, fallback: Self.reason(cause: cause))
+            // This dial's gathering says UDP does not get through here: the next one uses the relays over TCP and TLS alone.
+            if let media = media, let credential = credential, !relayOnlyByUs,
+               RtcResilience.udpLooksBlocked(media.gathered, servers: credential.iceServers),
+               !RtcResilience.tcpTlsRelays(credential.iceServers).isEmpty {
+                relayOnlyNextDial = true
+            }
+            // The link's own failures earn the third dial — a second fresh connection.
+            freshConnection(after: why, fallback: Self.reason(cause: cause), allowance: DialRules.isLinkFailure(cause: cause, code: code) ? 2 : 1)
         case .fallback:
             giveUp(Self.reason(cause: cause), why)
         }
     }
 
     /// A new SIP socket and registration for the same call — on the same credential while it has life, else a new one.
-    private func freshConnection(after why: String, fallback reason: GraineRtcFallback) {
-        guard freshConnections < 1, let credential = credential else {
+    private func freshConnection(after why: String, fallback reason: GraineRtcFallback, allowance: Int = 1) {
+        guard freshConnections < allowance, let credential = credential else {
             return giveUp(reason, why)
         }
         freshConnections += 1
@@ -683,15 +842,113 @@ final class RtcCallEngine: GraineRtcCall {
         old?.hangUp()
         old?.shutDown(grace: 0.5)
         redialing = true
-        if credential.remaining(at: parts.now()) < DialRules.credentialMinRemaining {
-            mint()
-        } else {
-            connectSip(credential)
+        if relayOnlyNextDial { remakeOfferOnRelays() }
+        let connect = { [weak self] in
+            guard let self = self, self.phase != .ended, self.redialing else { return }
+            if credential.remaining(at: self.parts.now()) < DialRules.credentialMinRemaining {
+                self.mint()
+            } else {
+                self.connectSip(credential)
+            }
         }
+        // Never into no network: a dial that failed because the phone lost its network would fail again at once.
+        if parts.network.online { return connect() }
+        trace("dial: no network — waiting for it before dialling again")
+        waitForNetwork(RtcResilience.redialOfflineWait) { [weak self] back in
+            guard let self = self, self.phase != .ended, self.redialing else { return }
+            if back {
+                self.trace("dial: the network is back")
+                connect()
+            } else {
+                self.giveUp(reason, "\(why); the network did not come back")
+            }
+        }
+    }
+
+    /**
+     * THE NEXT DIAL ON THE RELAYS OVER TCP AND TLS ALONE: the peer is told to
+     * gather only through them, and a new offer (new ICE credentials) is made
+     * before the INVITE goes — the dial waits for it (`offerStale`).
+     */
+    private func remakeOfferOnRelays() {
+        relayOnlyNextDial = false
+        guard let media = media, let credential = credential else { return }
+        let relays = RtcResilience.tcpTlsRelays(credential.iceServers)
+        guard !relays.isEmpty, media.useServers(relays, relayOnly: true) else { return }
+        relayOnlyByUs = true
+        offerStale = true
+        media.gatherPace = pace()
+        trace("ice: UDP looked blocked on the last dial — the next one gathers the relays over TCP and TLS only")
+        media.reoffer(iceRestart: true) { [weak self] result in
+            self?.clock.run {
+                guard let self = self, self.offerStale else { return }
+                self.offerStale = false
+                if case .success(let sdp) = result { self.offer = sdp } else { self.trace("ice: the relay-only offer could not be made — dialling with the one before") }
+                self.dialIfReady()
+            }
+        }
+    }
+
+    /// Wait for the network, at most `seconds` — and never past the end (`release` wakes it with false).
+    private func waitForNetwork(_ seconds: Double, _ done: @escaping (Bool) -> Void) {
+        wakeNetworkWaiter(false)
+        var settled = false
+        let finish: (Bool) -> Void = { [weak self] back in
+            guard !settled else { return }
+            settled = true
+            self?.networkWaitTimer?.cancel()
+            self?.networkWaitTimer = nil
+            done(back)
+        }
+        networkWaiter = finish
+        networkWaitTimer = clock.after(seconds) { [weak self] in
+            guard let self = self else { return }
+            self.networkWaiter = nil
+            finish(false)
+        }
+    }
+
+    private func wakeNetworkWaiter(_ back: Bool) {
+        let waiter = networkWaiter
+        networkWaiter = nil
+        waiter?(back)
+    }
+
+    /**
+     * The network changed: the last network's word on UDP is worthless, the
+     * recovery hears it (nothing restarted into no network; a new network is
+     * worth a new gathering), and a redial waiting for it goes.
+     */
+    private func networkChanged(_ online: Bool) {
+        guard phase != .ended else { return }
+        trace("network: \(online ? "available" : "gone")")
+        media?.forgetGathered()
+        relayOnlyNextDial = false
+        recovery?.networkChanged(online: online)
+        if online { wakeNetworkWaiter(true) }
+    }
+
+    /// The link's pace (RtcPace): its registration and its media round trip; 1 when nothing was measured.
+    private func pace() -> Double {
+        RtcPace.of(registerSeconds: registerSeconds, roundTripSeconds: mediaRoundTrip)
     }
 
     private func budgetSpent() {
         guard phase < .live else { return }
+        // A slow link's own pace: the attempt's budget grows with it.
+        if let armed = budgetArmedAt {
+            let left = request.budgetSeconds * RtcPace.clamp(pace()) - (clock.now - armed)
+            if left > 1e-6 {
+                budgetTimer = clock.after(left) { [weak self] in self?.budgetSpent() }
+                return
+            }
+        }
+        // Answered, and the recovery still working on the media path (a restart out, its window, a setup still moving):
+        // the recovery decides — bounded at 30 s after the answer.
+        if phase == .answered, recovery?.holdsTheSetup == true, let answered = answeredAt, clock.now < answered + 30 - 1e-6 {
+            budgetTimer = clock.after(answered + 30 - clock.now) { [weak self] in self?.budgetSpent() }
+            return
+        }
         let reason: GraineRtcFallback
         switch phase {
         case .preparing: reason = credential == nil ? .mintFailed : (registered ? .error : .registerFailed)
@@ -712,7 +969,12 @@ final class RtcCallEngine: GraineRtcCall {
             case .connected, .completed:
                 goLive()
             case .failed:
-                giveUp(.iceTimeout, "the media path failed before it connected", media: "ice_failed")
+                // A restart inside the call before the WebSocket (RtcMediaRecovery acts on it at once).
+                if let recovery = recovery {
+                    recovery.pathLost(failed: true)
+                } else {
+                    giveUp(.iceTimeout, "the media path failed before it connected", media: "ice_failed")
+                }
             default:
                 break
             }
@@ -721,20 +983,11 @@ final class RtcCallEngine: GraineRtcCall {
         guard phase == .live else { return }
         switch state {
         case .connected, .completed:
-            if let began = dropBegan {
-                trace("media: back after \(Int((clock.now - began) * 1000)) ms")
-                // Healed by the restart it was given (back on its own, it is no recovery of ours).
-                if restartedAt != nil { sendRecoveryRow("ice_restart", since: began) }
-            }
-            restartedAt = nil
-            dropBegan = nil
-            for timer in dropTimers { timer.cancel() }
-            dropTimers = []
-            setReconnecting(false)
+            // Back: the recovery says the reconnect is over, and on the record if a restart brought it back.
+            recovery?.pathUp()
         case .disconnected, .failed:
             // Only here, with the media up before: a path that never connected is a fallback, never a reconnect.
-            setReconnecting(true)
-            mediaLost(failed: state == .failed)
+            recovery?.pathLost(failed: state == .failed)
         default:
             break
         }
@@ -751,8 +1004,9 @@ final class RtcCallEngine: GraineRtcCall {
     private func goLive() {
         guard phase == .answered else { return }
         phase = .live
-        iceTimer?.cancel()
         budgetTimer?.cancel()
+        // The path is up: a restart that brought it up is on the record.
+        recovery?.pathUp()
         mark("connected")
         trace("connected: media \(ms(since: "answered")) ms after the answer, \(ms(since: nil)) ms after the start")
         emit(.connected)
@@ -762,59 +1016,7 @@ final class RtcCallEngine: GraineRtcCall {
             sendRecoveryRow("redial", since: heal.since)
         }
         pollLevel()
-    }
-
-    /// The path went away: restart it once if it fits, and call it dropped if it does not come back.
-    private func mediaLost(failed: Bool) {
-        let first = dropBegan == nil
-        if first {
-            dropBegan = clock.now
-            trace("media: \(failed ? "failed" : "disconnected")")
-            dropTimers.append(clock.after(Self.restartAfter) { [weak self] in
-                guard let self = self, self.phase == .live, self.dropBegan != nil else { return }
-                self.restartIce()
-            })
-            dropTimers.append(clock.after(Self.dropAfter) { [weak self] in
-                guard let self = self, self.phase == .live, self.dropBegan != nil, !self.restartTried else { return }
-                self.end(.dropped("the media path was lost for more than \(Int(Self.dropAfter)) s"))
-            })
-            dropTimers.append(clock.after(Self.restartDropAfter) { [weak self] in
-                guard let self = self, self.phase == .live, self.dropBegan != nil else { return }
-                self.end(.dropped("the media path did not come back within \(Int(Self.restartDropAfter)) s"))
-            })
-        }
-        if failed { restartIce() }
-    }
-
-    /// One re-INVITE with new ICE credentials; if it cannot be made or is refused, the call has dropped.
-    private func restartIce() {
-        guard !restartTried, phase == .live, let media = media, let ua = ua else { return }
-        restartTried = true
-        restartedAt = clock.now
-        setReconnecting(true)
-        trace("media: restarting ICE")
-        media.reoffer(iceRestart: true) { [weak self] result in
-            guard let self = self, self.phase == .live else { return }
-            switch result {
-            case .failure(let error):
-                self.end(.dropped("the media path was lost and could not be restarted (\(error))"))
-            case .success(let sdp):
-                ua.reinvite(sdp: sdp) { [weak self] answer in
-                    self?.clock.run {
-                        guard let self = self, self.phase == .live else { return }
-                        switch answer {
-                        case .failure(let failure):
-                            self.end(.dropped("the media path was lost and its restart was refused (\(self.describe(failure)))"))
-                        case .success(let answerSdp):
-                            media.applyAnswer(answerSdp) { [weak self] error in
-                                guard let self = self, self.phase == .live, let error = error else { return }
-                                self.end(.dropped("the restarted media path was refused (\(error))"))
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        routeUnwatch = parts.audio.watchRoute { [weak self] event in self?.clock.run { self?.routeEvent(event) } }
     }
 
     /// "Agent speaking", from what the receiver plays: five readings a second.
@@ -833,6 +1035,11 @@ final class RtcCallEngine: GraineRtcCall {
     }
 
     private func heardLevel(_ stats: RtcInboundAudio) {
+        watchPlayout(stats)
+        // Nothing received yet (only the playout count is known): no level, no quality.
+        guard stats.inbound, phase == .live else { return }
+        // The link's own round trip, for the pace the next deadlines scale with.
+        if let rtt = stats.roundTrip, rtt.isFinite, rtt > 0 { mediaRoundTrip = rtt }
         if stats.packetsReceived > 0, marks["first_packet"] == nil { mark("first_packet") }
         quality.add(stats)
         // The agent's voice as the receiver plays it out, for the call screen's visualiser (smoothed by the SDK).
@@ -858,6 +1065,169 @@ final class RtcCallEngine: GraineRtcCall {
                 emit(.speaking(false))
             }
         }
+    }
+
+    /**
+     * THE PLAYOUT WATCH — whether the agent's audio reaches the speaker, read
+     * from what the phone's playout counts (`samplesReceived`, `playoutSamples`:
+     * samples taken by the speaker, whatever they hold), never from the
+     * agent's level: a quiet agent is not a silent speaker.
+     *
+     *   ready     the audio activated (by CallKit, or started directly) and
+     *             the counts moving steadily for `readyStableSeconds`: the
+     *             control channel hears GraineRtcSignal.audioReady — the
+     *             greeting waits for it — and an `audio` row says so. Once;
+     *             and once more each time the audio comes back after it was
+     *             lost (taken back by the system, or stalled and restarted),
+     *             the row giving why: the server then knows how much of what
+     *             it sent may not have been heard
+     *   stalled   2 s of readings with packets arriving and not a sample
+     *             played — or with libwebrtc's own count of what the speaker
+     *             took standing still, which needs no packet (the greeting is
+     *             held for this very signal): the phone's audio started again
+     *             (RtcAudioControl.restart), once per stall — what the
+     *             session reported is the reason
+     *   unheard   3 s after that restart, 2 s of packets still unplayed — or a
+     *             restart that would not start: `playoutFailed`, and the core
+     *             ends the call (cause `audio_watch`). Only audio that arrived
+     *             and was not played ends a call; a count standing still alone
+     *             never does
+     *
+     * Nothing is judged where nothing is counted (a library that reports no
+     * samples), nor, without its own count, while nothing arrives.
+     */
+    private func watchPlayout(_ stats: RtcInboundAudio) {
+        guard phase == .live, !playoutFailed else { return }
+        let now = clock.now
+        let last = lastPlayout
+        lastPlayout = (stats.samplesReceived, stats.playoutSamples, stats.packetsReceived, now)
+        guard let before = last else { return }
+        func grew(_ now: Int?, _ then: Int?) -> Bool {
+            guard let now = now, let then = then else { return false }
+            return now > then
+        }
+        if grew(stats.samplesReceived, before.samples) || grew(stats.playoutSamples, before.playout) {
+            unplayedFor = 0
+            stillFor = 0
+            playoutRestartedAt = nil
+            guard audioOn else {
+                playingSince = nil
+                return
+            }
+            // Playing since the last reading — never since before the audio came on.
+            let since = playingSince ?? max(before.at, audioOnSince ?? before.at)
+            playingSince = since
+            guard !audioReady || readyAgainBecause != nil, now - since >= Self.readyStableSeconds - 1e-9 else { return }
+            let again = readyAgainBecause
+            audioReady = true
+            readyAgainBecause = nil
+            control?.send(GraineRtcSignal.audioReady, kind: nil)
+            sendAudioRow("ready", reason: again)
+            trace(again.map { "audio: playing again after it was lost (\($0)) — the channel told it is ready again" }
+                  ?? "audio: playing steadily (\(audioVia)) — the channel told it is ready")
+            return
+        }
+        // The counts stood still: a steady stretch starts over.
+        playingSince = nil
+        // While the system holds the audio, or the route settles, nothing is judged: the readings only keep the baseline.
+        if interrupted { return }
+        if let until = settleUntil {
+            guard now >= until - 1e-9 else { return }
+            settleUntil = nil
+        }
+        let elapsed = now - before.at
+        // Audio arrived, and the receiver counted none of it played.
+        if stats.inbound, stats.samplesReceived != nil, before.samples != nil, stats.packetsReceived > before.packets { unplayedFor += elapsed }
+        // libwebrtc's own count of what the speaker took, standing still.
+        if stats.playoutSamples != nil, before.playout != nil { stillFor += elapsed }
+        let stall = Self.playoutStallSeconds - 1e-9
+        if let restarted = playoutRestartedAt {
+            if unplayedFor >= stall, now - restarted >= Self.playoutFailAfter - 1e-9 { playoutUnheard("no_playout") }
+            return
+        }
+        guard unplayedFor >= stall || stillFor >= stall else { return }
+        let cause = parts.audio.stallCause() ?? "no_playout"
+        playoutRestartedAt = now
+        trace("audio: nothing played for \(Int((max(unplayedFor, stillFor) * 1000).rounded())) ms (\(cause)) — starting it again")
+        unplayedFor = 0
+        stillFor = 0
+        let restarted = parts.audio.restart()
+        sendAudioRow("playout_restarted", reason: cause)
+        if restarted {
+            // Started afresh: a steady stretch counts from now — and, said ready already, it is said again once it plays.
+            audioOn = true
+            audioOnSince = now
+            playingSince = nil
+            if audioReady { readyAgainBecause = cause }
+        } else {
+            playoutUnheard(cause)
+        }
+    }
+
+    /**
+     * THE ROUTE MOVED, or the system interrupted the audio. iOS remakes the
+     * audio unit for the new output — a Bluetooth headset's or a car kit's
+     * hands-free link can take seconds — and nothing plays meanwhile while
+     * packets keep arriving, which the playout watch would read as a stall.
+     * Once this call's audio has been heard, the watch stands aside: its
+     * counts begin afresh (the next reading is the baseline), nothing is
+     * judged for `routeSettleSeconds`, and a restart already made is judged
+     * from the end of the settling. Before the audio was ever heard there is
+     * no healthy audio to protect, and the rescue of a call that never played
+     * is not delayed. An interruption pauses the watch either way, until it
+     * ends (then it settles, as for a move). Each move is said in an `audio`
+     * row: the output's kind only.
+     */
+    private func routeEvent(_ event: RtcAudioRouteEvent) {
+        guard phase == .live, !playoutFailed else { return }
+        switch event {
+        case .changed(let kind):
+            if kind != lastRoute, routeRows < Self.routeRowsMax {
+                routeRows += 1
+                lastRoute = kind
+                sendAudioRow("route_changed", reason: nil, route: kind)
+            }
+            guard audioReady else { return }
+            standAside()
+            trace("audio: the route moved (\(kind ?? "unknown")) — nothing judged for \(Int(Self.routeSettleSeconds)) s")
+        case .interrupted:
+            // Whether or not anything was heard yet: a restart while the system holds the audio could only fail.
+            interrupted = true
+            settleUntil = nil
+            freshCounts()
+            trace("audio: the system interrupted it — nothing judged until it ends")
+        case .resumed(let kind):
+            interrupted = false
+            freshCounts()
+            guard audioReady else { return }
+            standAside()
+            trace("audio: the interruption ended (\(kind ?? "unknown")) — nothing judged for \(Int(Self.routeSettleSeconds)) s")
+        }
+    }
+
+    /// The watch's counts begin afresh: the next reading is the baseline.
+    private func freshCounts() {
+        unplayedFor = 0
+        stillFor = 0
+        lastPlayout = nil
+        playingSince = nil
+    }
+
+    /// Nothing judged for `routeSettleSeconds`; a restart already made is judged from the end of it.
+    private func standAside() {
+        freshCounts()
+        let until = clock.now + Self.routeSettleSeconds
+        settleUntil = max(settleUntil ?? until, until)
+        if let restarted = playoutRestartedAt { playoutRestartedAt = max(restarted, until) }
+    }
+
+    /// The call cannot be heard: said once, in a row and to the SDK, which ends it.
+    private func playoutUnheard(_ reason: String) {
+        guard !playoutFailed else { return }
+        playoutFailed = true
+        sendAudioRow("failed", reason: reason)
+        trace("audio: nothing played after the restart (\(reason)) — the call cannot be heard")
+        emit(.playoutFailed("audio arrived and nothing played (\(reason))"))
     }
 
     // MARK: - Endings
@@ -895,9 +1265,16 @@ final class RtcCallEngine: GraineRtcCall {
 
     private func release(sendBye: Bool) {
         phase = .ended
-        for timer in [budgetTimer, heardTimer, answerTimer, answerClock, iceTimer, registerTimer, levelTimer] { timer?.cancel() }
-        for timer in dropTimers { timer.cancel() }
-        dropTimers = []
+        routeUnwatch?()
+        routeUnwatch = nil
+        for timer in [budgetTimer, heardTimer, answerTimer, answerClock, registerTimer, levelTimer, networkWaitTimer] { timer?.cancel() }
+        // No restart and no redial after the end: the recovery goes, and a redial waiting for the network is told no.
+        let kept = recovery
+        recovery = nil
+        kept?.dispose()
+        wakeNetworkWaiter(false)
+        networkUnwatch?()
+        networkUnwatch = nil
         if sendBye { ua?.hangUp() }
         ua?.shutDown()
         ua = nil
@@ -1004,6 +1381,13 @@ final class RtcCallEngine: GraineRtcCall {
         sendRow("recovery", ["what": what, "after_ms": span(since, clock.now)])
     }
 
+    /// The phone's audio when it matters (GraineCallTelemetry.audioFrame): ready once, and each exception — from the tap.
+    private func sendAudioRow(_ event: String, reason: String?, route: String? = nil) {
+        let frame = GraineCallTelemetry.audioFrame(event: event, transport: "rtc", via: audioVia, reason: reason,
+                                                   afterMs: span(marks["begin"] ?? startedAt, clock.now), route: route)
+        if let frame = frame { sendRow(frame) }
+    }
+
     /**
      * The audio as received so far — the running figures the quality row will
      * carry — up to the SDK about once a second while the call is live, for
@@ -1093,6 +1477,7 @@ final class RtcCallEngine: GraineRtcCall {
     static func describe(cause: String, code: Int?) -> String {
         if cause == "no_response" { return "no reply to the INVITE" }
         if cause == "no_answer" { return "not answered" }
+        if code == 491 { return "491 Request Pending" }
         return code.map { "\(cause) \($0)" } ?? cause
     }
 
@@ -1104,6 +1489,114 @@ final class RtcCallEngine: GraineRtcCall {
         default: return .error
         }
     }
+}
+
+// MARK: - The media path, kept (RtcMediaRecovery's host)
+
+extension RtcCallEngine: RtcRecoveryHost {
+    func recoveryPace() -> Double { pace() }
+
+    func recoveryOnline() -> Bool { parts.network.online }
+
+    /// The call is answered, its socket is open (not reconnecting), and no offer of ours or theirs is out.
+    func recoveryCanReoffer() -> Bool {
+        guard phase == .answered || phase == .live, media != nil, let ua = ua else { return false }
+        return ua.isOpen && sipLostAt == nil && !restartOut && !ua.reinviteInFlight
+    }
+
+    /**
+     * ONE ICE RESTART, inside the answered call: the peer offers again with new
+     * ICE credentials (gathered by the same rule, on the relays over TCP and TLS
+     * alone when `relayOnly`, on every server again otherwise — a relay-only
+     * setting this engine made never outlives the restart after it), sent as a
+     * re-INVITE in the dialog, its answer applied. Never a new call: no second
+     * conversation, no greeting, the audio-ready word already said stays said.
+     */
+    func recoveryRestart(_ n: Int, relayOnly: Bool, _ on: RtcRestartHandlers) -> Bool {
+        guard recoveryCanReoffer(), let media = media, let ua = ua, let credential = credential else { return false }
+        let seq = dialSeq
+        if relayOnly {
+            let relays = RtcResilience.tcpTlsRelays(credential.iceServers)
+            if !relays.isEmpty, media.useServers(relays, relayOnly: true) { relayOnlyByUs = true }
+        } else if relayOnlyByUs {
+            if media.useServers(credential.iceServers, relayOnly: false) { relayOnlyByUs = false }
+        }
+        media.gatherPace = pace()
+        restartOut = true
+        let still: () -> Bool = { [weak self] in
+            guard let self = self else { return false }
+            return seq == self.dialSeq && (self.phase == .answered || self.phase == .live)
+        }
+        media.reoffer(iceRestart: true) { [weak self] result in
+            self?.clock.run {
+                guard let self = self else { return }
+                guard still() else { self.restartOut = false; return }
+                switch result {
+                case .failure(let error):
+                    self.restartOut = false
+                    on.refused("its offer could not be made (\(error))")
+                case .success(let sdp):
+                    on.offer(RtcResilience.candidateCount(sdp))
+                    guard still() else { self.restartOut = false; return }
+                    ua.reinvite(sdp: sdp) { [weak self] answer in
+                        self?.clock.run {
+                            guard let self = self else { return }
+                            self.restartOut = false
+                            guard still() else { return }
+                            switch answer {
+                            case .failure(let failure):
+                                on.refused(self.describe(failure))
+                            case .success(let answerSdp):
+                                media.applyAnswer(answerSdp) { [weak self] error in
+                                    guard let self = self, still() else { return }
+                                    if let error = error { on.refused("its answer was refused (\(error))") } else { on.answered() }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    func recoveryStats(_ done: @escaping (RtcIceReading?) -> Void) {
+        guard let media = media else { return done(nil) }
+        media.iceStats(done)
+    }
+
+    func recoveryUdpBlocked() -> Bool {
+        guard let media = media, let credential = credential else { return false }
+        return RtcResilience.udpLooksBlocked(media.gathered, servers: credential.iceServers) && !RtcResilience.tcpTlsRelays(credential.iceServers).isEmpty
+    }
+
+    func recoveryFailed(_ failure: RtcMediaFailure) {
+        switch phase {
+        case .answered:
+            // Before any audio: the WebSocket carries the call, as before.
+            if case .iceFailed = failure {
+                giveUp(.iceTimeout, failure.detail, media: "ice_failed")
+            } else {
+                giveUp(.iceTimeout, failure.detail, media: "ice_timeout")
+            }
+        case .live:
+            end(.dropped(failure.detail))
+        default:
+            break
+        }
+    }
+
+    func recoveryReconnecting(_ active: Bool) {
+        guard phase == .live || !active else { return }
+        setReconnecting(active)
+    }
+
+    func recoveryRecovered(restarts: Int, seconds: Double) {
+        trace("media: back after \(Int((seconds * 1000).rounded())) ms — \(restarts) ICE restart\(restarts > 1 ? "s" : "")")
+        sendRecoveryRow("ice_restart", since: clock.now - seconds)
+    }
+
+    func recoveryLog(_ line: String) { trace(line) }
 }
 
 /// The receiver's numbers across a call, from the five-a-second readings: for its quality row.

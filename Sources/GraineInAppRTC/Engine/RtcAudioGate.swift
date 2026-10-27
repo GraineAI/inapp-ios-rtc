@@ -27,6 +27,15 @@ import os.log
  * last leg ends: CallKit, which never activated it, will not, and a session
  * the app keeps active is one CallKit never hands the next call. Every step
  * says what happened in the log (subsystem ai.graine.inapp, category GraineRTC).
+ *
+ * WHEN AUDIO ARRIVES AND NOTHING PLAYS (the leg's playout watch, `restart`):
+ * WebRTC is told afresh that the session is active — which also ends an
+ * interruption it still believes in: one that began after CallKit's
+ * activation is never ended on a locked phone, where only the app coming to
+ * the front would end it — and its audio unit is made again, the session
+ * activated here as the rescue activates it. What WebRTC reported meanwhile
+ * (an interruption, an audio unit that would not start) is the restart's
+ * reason, for the call's `audio` row.
  */
 final class RtcAudioGate: RtcAudioControl {
     static let shared = RtcAudioGate()
@@ -39,13 +48,28 @@ final class RtcAudioGate: RtcAudioControl {
     private var holders = 0
     /// The session was activated here (the rescue), not by CallKit: it is let go of here.
     private var activatedHere = false
+    /// What WebRTC says of the session as it goes: held strongly here, as WebRTC holds its delegates weakly.
+    private let reports = RtcAudioSessionReports()
 
     private var session: LKRTCAudioSession { LKRTCAudioSession.sharedInstance() }
+
+    private init() {
+        session.add(reports)
+    }
 
     func callBegins() {
         lock.lock()
         defer { lock.unlock() }
-        if holders == 0 { saved = (session.useManualAudio, session.isAudioEnabled) }
+        if holders == 0 {
+            saved = (session.useManualAudio, session.isAudioEnabled)
+            // No call holds the gate, yet WebRTC still believes a session active: the last call's, its deactivation never
+            // told (or told to a leg already gone). Forgotten now, so that THIS call's activation is the one it trusts.
+            // The session itself is not touched: CallKit may be activating it for this call this very moment.
+            if session.isActive {
+                session.audioSessionDidDeactivate(AVAudioSession.sharedInstance())
+                Self.note("a previous call's audio session was still believed active: reset before this call.")
+            }
+        }
         holders += 1
         session.useManualAudio = true
         session.isAudioEnabled = false
@@ -59,6 +83,53 @@ final class RtcAudioGate: RtcAudioControl {
     }
 
     func startDirectly() -> Bool {
+        guard activateHere() else { return false }
+        Self.note("the call's audio was started directly (CallKit never activated it): WebRTC's audio is on.")
+        return true
+    }
+
+    func restart() -> Bool {
+        // Balanced: the activation below tells WebRTC the session is active again, and ends any interruption it holds.
+        if session.isActive { session.audioSessionDidDeactivate(AVAudioSession.sharedInstance()) }
+        guard activateHere() else { return false }
+        Self.note("audio arrived and nothing played: WebRTC's audio was started again.")
+        return true
+    }
+
+    /**
+     * The route as iOS reports it — every route change (a Bluetooth headset or
+     * car kit connecting or leaving, the speaker toggled), and an
+     * interruption's start and end — with the output's kind now. Posted on a
+     * system thread; the leg hops to its own.
+     */
+    func watchRoute(_ heard: @escaping (RtcAudioRouteEvent) -> Void) -> () -> Void {
+        let center = NotificationCenter.default
+        let audio = AVAudioSession.sharedInstance()
+        let kindNow = { RtcAudioRoute.kind(audio.currentRoute.outputs.first?.portType.rawValue) }
+        let route = center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) { _ in
+            heard(.changed(kindNow()))
+        }
+        let interruption = center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { note in
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            heard(type == .began ? .interrupted : .resumed(kindNow()))
+        }
+        return {
+            center.removeObserver(route)
+            center.removeObserver(interruption)
+        }
+    }
+
+    func stallCause() -> String? {
+        if reports.interrupted { return "interrupted" }
+        if reports.unitFailed { return "unit_failed" }
+        if !session.isAudioEnabled { return "disabled" }
+        if !session.isActive { return "inactive" }
+        return nil
+    }
+
+    /// The session activated here, on AVAudioSession itself, and WebRTC told as CallKit's activation tells it; its audio enabled afresh.
+    private func activateHere() -> Bool {
         let audio = AVAudioSession.sharedInstance()
         session.lockForConfiguration()
         do {
@@ -76,7 +147,6 @@ final class RtcAudioGate: RtcAudioControl {
         // Told as CallKit's activation tells it: active, and any interruption it held over from the ring is over.
         session.audioSessionDidActivate(audio)
         enable()
-        Self.note("the call's audio was started directly (CallKit never activated it): WebRTC's audio is on.")
         return true
     }
 
@@ -136,6 +206,7 @@ final class RtcAudioGate: RtcAudioControl {
 
     /// On — and started afresh when it already was: an audio unit that could not start against a session not yet active runs now.
     private func enable() {
+        reports.unitFailed = false
         if session.isAudioEnabled { session.isAudioEnabled = false }
         session.isAudioEnabled = true
     }
@@ -176,6 +247,56 @@ final class RtcAudioGate: RtcAudioControl {
 
     private static func warn(_ line: String) {
         os_log("%{public}@", log: log, type: .error, "warning: Calls: " + line)
+    }
+}
+
+/**
+ * WebRTC's own word on the session, from its delegate (on a system or WebRTC
+ * thread): an interruption that began and has not ended — WebRTC stops its
+ * audio unit then and ignores every change until it ends — and an audio unit
+ * that would not start. Read for a restart's reason; logged as they come.
+ */
+private final class RtcAudioSessionReports: NSObject, LKRTCAudioSessionDelegate {
+    private let lock = NSLock()
+    private var interruptedNow = false
+    private var unitFailedNow = false
+    private static let log = OSLog(subsystem: "ai.graine.inapp", category: "GraineRTC")
+
+    var interrupted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return interruptedNow
+    }
+
+    var unitFailed: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return unitFailedNow
+        }
+        set {
+            lock.lock()
+            unitFailedNow = newValue
+            lock.unlock()
+        }
+    }
+
+    func audioSessionDidBeginInterruption(_ session: LKRTCAudioSession) {
+        lock.lock()
+        interruptedNow = true
+        lock.unlock()
+        os_log("%{public}@", log: Self.log, type: .default, "Calls: WebRTC reports the audio session interrupted.")
+    }
+
+    func audioSessionDidEndInterruption(_ session: LKRTCAudioSession, shouldResumeSession: Bool) {
+        lock.lock()
+        interruptedNow = false
+        lock.unlock()
+    }
+
+    func audioSession(_ audioSession: LKRTCAudioSession, audioUnitStartFailedWithError error: Error) {
+        unitFailed = true
+        os_log("%{public}@", log: Self.log, type: .error, "warning: Calls: WebRTC's audio unit would not start: \(RtcAudioGate.describe(error))")
     }
 }
 #endif

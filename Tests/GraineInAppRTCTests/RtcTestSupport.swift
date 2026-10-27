@@ -149,6 +149,17 @@ final class ScriptedSbc {
     var holdFinal = false
     private var heldFinal: (() -> Void)?
     private var nonce = 0
+    /// A re-INVITE (an ICE restart) is answered with this: 200 with the answer, another code as a refusal.
+    var reinviteFinal = 200
+    /// Hold each re-INVITE's answer until the test releases it (`releaseReinvite`).
+    var holdReinvite = false
+    private var heldReinvite: (() -> Void)?
+
+    func releaseReinvite() {
+        let held = heldReinvite
+        heldReinvite = nil
+        held?()
+    }
 
     func releaseFinal() {
         let held = heldFinal
@@ -175,8 +186,18 @@ final class ScriptedSbc {
             }
         case "INVITE":
             if m.toTag != nil {
-                // A re-INVITE (an ICE restart): answered at once.
-                socket.deliver(Self.reply(m, 200, toTag: m.toTag, extra: ["Contact: <sip:198.51.100.7:5060;transport=tcp>", "Content-Type: application/sdp"], body: answerSdp))
+                // A re-INVITE (an ICE restart): answered at once, unless the test holds or refuses it.
+                let code = reinviteFinal
+                let sdp = answerSdp
+                let answer = { [weak socket] in
+                    guard let socket = socket else { return }
+                    if code == 200 {
+                        socket.deliver(Self.reply(m, 200, toTag: m.toTag, extra: ["Contact: <sip:198.51.100.7:5060;transport=tcp>", "Content-Type: application/sdp"], body: sdp))
+                    } else {
+                        socket.deliver(Self.reply(m, code, toTag: m.toTag))
+                    }
+                }
+                if holdReinvite { heldReinvite = answer } else { answer() }
                 return
             }
             if sendTrying { socket.deliver(Self.reply(m, 100)) }
@@ -288,9 +309,18 @@ final class ScriptedMedia: RtcMedia {
         done(.success("v=0\r\no=- answer\r\n"))
     }
 
+    /// What a re-offer makes (the trace's offer, candidates inside, by default); nil holds it until `finishReoffer`.
+    var reofferResult: Result<String, RtcMediaError>? = .success(TraceSdp.offer)
+    private var pendingReoffer: ((Result<String, RtcMediaError>) -> Void)?
+
     func reoffer(iceRestart: Bool, done: @escaping (Result<String, RtcMediaError>) -> Void) {
         reoffers.append(iceRestart)
-        done(.success(TraceSdp.offer))
+        if let result = reofferResult { done(result) } else { pendingReoffer = done }
+    }
+
+    func finishReoffer(_ result: Result<String, RtcMediaError> = .success(TraceSdp.offer)) {
+        pendingReoffer?(result)
+        pendingReoffer = nil
     }
 
     func inboundAudio(_ done: @escaping (RtcInboundAudio?) -> Void) { done(level) }
@@ -298,15 +328,61 @@ final class ScriptedMedia: RtcMedia {
     func close() { closed = true }
 
     func ice(_ state: RtcIceState) { onIceState?(state) }
+
+    // Weak networks.
+    var gatherPace = 1.0
+    var gathered = RtcGathered()
+    private(set) var forgets = 0
+    func forgetGathered() {
+        gathered = RtcGathered()
+        forgets += 1
+    }
+    /// What the checks say. By default one pair in progress and nothing answered: neither progress nor "nothing in flight".
+    var iceReading: RtcIceReading? = RtcIceReading(pairs: 1, inProgress: 1, requestsSent: 3)
+    func iceStats(_ done: @escaping (RtcIceReading?) -> Void) { done(iceReading) }
+    private(set) var serverChanges: [(servers: [RtcIceServer], relayOnly: Bool)] = []
+    var refusesServers = false
+    func useServers(_ servers: [RtcIceServer], relayOnly: Bool) -> Bool {
+        serverChanges.append((servers, relayOnly))
+        return !refusesServers
+    }
+}
+
+/// A network the test switches: gone, back, another one.
+final class ScriptedNetwork: RtcNetwork {
+    var online = true
+    private var watchers: [(Bool) -> Void] = []
+    func watch(_ changed: @escaping (Bool) -> Void) -> () -> Void {
+        watchers.append(changed)
+        return {}
+    }
+    func set(_ value: Bool) {
+        online = value
+        for watcher in watchers { watcher(value) }
+    }
 }
 
 final class RecordingAudioControl: RtcAudioControl {
     private(set) var steps: [String] = []
     var directStarts = true
+    var restarts = true
+    /// What the session would say of a stall (an `audio` row's reason).
+    var cause: String?
     func callBegins() { steps.append("begins") }
     func activated() { steps.append("activated") }
     func startDirectly() -> Bool { steps.append("direct"); return directStarts }
     func deactivated() { steps.append("deactivated") }
+    func restart() -> Bool { steps.append("restart"); return restarts }
+    func stallCause() -> String? { cause }
+    /// Who hears the route now (the live call), so a test can move it.
+    private(set) var routeWatcher: ((RtcAudioRouteEvent) -> Void)?
+    private(set) var routeWatches = 0
+    func watchRoute(_ heard: @escaping (RtcAudioRouteEvent) -> Void) -> () -> Void {
+        routeWatcher = heard
+        routeWatches += 1
+        return { [weak self] in self?.routeWatcher = nil }
+    }
+    func route(_ event: RtcAudioRouteEvent) { routeWatcher?(event) }
     func callEnds() { steps.append("ends") }
 }
 

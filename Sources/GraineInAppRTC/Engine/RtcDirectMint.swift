@@ -84,9 +84,10 @@ struct RtcDirectOffer: Equatable {
 
 /**
  * A call's mint body, read back. The core writes it (RtcMintBody): the
- * publishable key, the session id, the variables, who the customer is and the
- * call's id. The grant requests and the direct mint are built from it, so the
- * core hands this module nothing new for them.
+ * publishable key, the session id, the variables, who the customer is, the
+ * call's id — and that the phone says when its audio plays. The grant
+ * requests and the direct mint are built from it, so the core hands this
+ * module nothing new for them.
  */
 struct RtcMintBodyParts {
     /// The publishable key and who the customer is: everything but the call's own.
@@ -96,9 +97,11 @@ struct RtcMintBodyParts {
     let variables: [String: Any]?
     /// The call's id: what its grant names, and what it is looked up by.
     let callId: String?
+    /// `audio_ready_signal`: this phone says when the call's audio plays (GraineRtcSignal.audioReady) — on every body sent for the call.
+    let audioReadySignal: Bool
 
-    /// The call's own fields. Everything else is who the customer is.
-    static let callFields: Set<String> = ["session_id", "variables", "callId"]
+    /// The call's own fields. Everything else is who the customer is (and the app's declaration, sent on as it came).
+    static let callFields: Set<String> = ["session_id", "variables", "callId", "audio_ready_signal"]
 
     init?(_ data: Data) {
         guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -108,12 +111,24 @@ struct RtcMintBodyParts {
         sessionId = (object["session_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         variables = object["variables"] as? [String: Any]
         callId = (object["callId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        audioReadySignal = DirectJSON.isTrue(object["audio_ready_signal"])
         identityFields = object.filter { !Self.callFields.contains($0.key) }
     }
 
-    /// Changes exactly when who a grant is for changes: the key and every identity field.
+    /**
+     * Changes exactly when who a grant is for changes: the key and every
+     * identity field — the identity token among them (a grant carries the
+     * verdict it was signed under). Not what renews on its own: the app's
+     * declaration (its pass, daily) and the user pass (hourly).
+     */
     var identityKey: String {
-        DirectJSON.text(identityFields) ?? publishableKey
+        var who = identityFields
+        who.removeValue(forKey: "app")
+        if var identity = who["identity"] as? [String: Any] {
+            identity.removeValue(forKey: "pass")
+            who["identity"] = identity
+        }
+        return DirectJSON.text(who) ?? publishableKey
     }
 
     /// The web route's grant-only request: the same key and customer, and the call the grant is to name.
@@ -121,6 +136,7 @@ struct RtcMintBodyParts {
         var body = identityFields
         body["grant_only"] = true
         if let id = callId { body["callId"] = id }
+        if audioReadySignal { body["audio_ready_signal"] = true }
         return DirectJSON.data(body)
     }
 
@@ -129,6 +145,7 @@ struct RtcMintBodyParts {
         var body: [String: Any] = ["grant": grant]
         if let id = sessionId { body["session_id"] = id }
         if let variables = variables { body["variables"] = variables }
+        if audioReadySignal { body["audio_ready_signal"] = true }
         return DirectJSON.data(body)
     }
 }
@@ -224,6 +241,8 @@ final class RtcDirectMint {
     private var routes: [String: URL] = [:]
     private var failures = 0
     private var refusedGrants = 0
+    /// Who hears each agent's grant-only answers: what the web route said of the app and the user (APP-IDENTITY.md §2.2).
+    private var hearing: [String: (Int, Data?) -> Void] = [:]
     /// While the direct mint rests: until when (wall clock), and why.
     private var restUntil: Double?
     private(set) var restReason: String?
@@ -250,22 +269,24 @@ final class RtcDirectMint {
      * takes grants when a grant arrives (and again after an answer that never
      * came). `body` is a mint body (RtcMintBody). Any thread; nothing waits.
      */
-    func warm(baseUrl: String, body: Data, log: ((String) -> Void)? = nil) {
+    /// `tokens`: the agent's server tokens — a grant request to the web route carries one (CLIENT-TOKENS.md §2.2); nil sends none.
+    func warm(baseUrl: String, body: Data, tokens: GraineRtcTokens? = nil, log: ((String) -> Void)? = nil, heard: ((Int, Data?) -> Void)? = nil) {
         clock.run { [self] in
             guard let parts = RtcMintBodyParts(body) else { return }
             let slot = Self.slotKey(baseUrl, parts.publishableKey)
+            if let heard = heard { hearing[slot] = heard }
             if let callId = parts.callId {
                 // A ringing call's: asked for under whoever its request names — perhaps nobody yet, an app a push
                 // woke before its session said who the customer is — and forgetting nobody's.
                 if restingNow() != nil { return }
-                askFor(GrantKey(slot: slot, identity: parts.identityKey, callId: callId), baseUrl: baseUrl, parts: parts, log: log)
+                askFor(GrantKey(slot: slot, identity: parts.identityKey, callId: callId), baseUrl: baseUrl, parts: parts, tokens: tokens, log: log)
             } else {
                 // The app's own warm-up (the session, identify, setMemory, the foreground): who the customer is now.
                 // Only here do another customer's grants go.
                 forgetOthers(slot, identity: parts.identityKey, log: log)
                 // Resting: nobody is asked anything until the rest is over.
                 if restingNow() != nil { return }
-                warmNext(slot, baseUrl: baseUrl, parts: parts, log: log)
+                warmNext(slot, baseUrl: baseUrl, parts: parts, tokens: tokens, log: log)
             }
         }
     }
@@ -278,7 +299,7 @@ final class RtcDirectMint {
      * anyone's grants (the caller has made sure it is not another customer's
      * next call it would renew).
      */
-    private func warmNext(_ slot: String, baseUrl: String, parts: RtcMintBodyParts, log: ((String) -> Void)?) {
+    private func warmNext(_ slot: String, baseUrl: String, parts: RtcMintBodyParts, tokens: GraineRtcTokens?, log: ((String) -> Void)?) {
         let kept = next[slot]
         if let kept = kept, let h = held[kept], !h.due(at: now) {
             // A usable grant, not half spent: nothing for the web route; the gateway only if its answer never came.
@@ -289,15 +310,15 @@ final class RtcDirectMint {
         // Renewed, a grant keeps its call's id: it is for the same next call.
         let key = GrantKey(slot: slot, identity: parts.identityKey, callId: kept?.callId ?? newCallId())
         askingNext[slot] = key
-        fetch(key, baseUrl: baseUrl, parts: parts, log: log)
+        fetch(key, baseUrl: baseUrl, parts: parts, tokens: tokens, log: log)
     }
 
     /// A named call's grant — a ringing call's: asked for unless a usable one is in hand or on its way.
-    private func askFor(_ key: GrantKey, baseUrl: String, parts: RtcMintBodyParts, log: ((String) -> Void)?) {
+    private func askFor(_ key: GrantKey, baseUrl: String, parts: RtcMintBodyParts, tokens: GraineRtcTokens?, log: ((String) -> Void)?) {
         if let h = held[key], h.usable(at: now) { return }
         guard !askingCalls.contains(key), !unoffered.contains(key.slot), !quiet(key.slot) else { return }
         askingCalls.insert(key)
-        fetch(key, baseUrl: baseUrl, parts: parts, log: log)
+        fetch(key, baseUrl: baseUrl, parts: parts, tokens: tokens, log: log)
     }
 
     /// The web route refused this agent's last grant request, and its wait is not over.
@@ -326,12 +347,16 @@ final class RtcDirectMint {
 
     // MARK: - A call's mint
 
-    /// The call's credential from the gateway, or the web route. `done` runs on this object's clock. Any thread.
-    func mint(baseUrl: String, body: Data, done: @escaping (RtcDirectAnswer) -> Void) {
-        clock.run { [self] in attempt(baseUrl: baseUrl, body: body, done: done) }
+    /**
+     * The call's credential from the gateway, or the web route. `done` runs on
+     * this object's clock. Any thread. `tokens`: the agent's server tokens, for
+     * the next call's grant fetched behind this mint.
+     */
+    func mint(baseUrl: String, body: Data, tokens: GraineRtcTokens? = nil, done: @escaping (RtcDirectAnswer) -> Void) {
+        clock.run { [self] in attempt(baseUrl: baseUrl, body: body, tokens: tokens, done: done) }
     }
 
-    private func attempt(baseUrl: String, body: Data, done: @escaping (RtcDirectAnswer) -> Void) {
+    private func attempt(baseUrl: String, body: Data, tokens: GraineRtcTokens?, done: @escaping (RtcDirectAnswer) -> Void) {
         guard let parts = RtcMintBodyParts(body) else { return done(.webRoute("the mint's body names no publishable key")) }
         let slot = Self.slotKey(baseUrl, parts.publishableKey)
         // Whatever this call's mint comes to, the next call's grant follows it, under the same rules as a warm-up —
@@ -339,7 +364,7 @@ final class RtcDirectMint {
         let finish: (RtcDirectAnswer) -> Void = { [self] answer in
             done(answer)
             guard restingNow() == nil, next[slot].map({ $0.identity == parts.identityKey }) ?? true else { return }
-            warmNext(slot, baseUrl: baseUrl, parts: parts, log: nil)
+            warmNext(slot, baseUrl: baseUrl, parts: parts, tokens: tokens, log: nil)
         }
         if let why = restingNow() { return finish(.webRoute("resting (\(why))")) }
         let key = GrantKey(slot: slot, identity: parts.identityKey, callId: parts.callId)
@@ -459,19 +484,41 @@ final class RtcDirectMint {
         if !theirs.isEmpty { log?("direct mint: the customer changed — the grants asked for the one before are let go") }
     }
 
-    /// The web route's grant-only mode, in the background, for exactly `key`.
-    private func fetch(_ key: GrantKey, baseUrl: String, parts: RtcMintBodyParts, log: ((String) -> Void)?) {
+    /**
+     * The web route's grant-only mode, in the background, for exactly `key` —
+     * with the agent's server token when tokens are in play: a refusal a fresh
+     * one can lift is asked once more with it (GraineRtcTokens).
+     */
+    private func fetch(_ key: GrantKey, baseUrl: String, parts: RtcMintBodyParts, tokens: GraineRtcTokens?, log: ((String) -> Void)?) {
         guard let url = Self.sessionURL(baseUrl) else {
             if askingNext[key.slot] == key { askingNext[key.slot] = nil }
             askingCalls.remove(key)
             return
         }
-        request(url, json: parts.grantOnlyBody(callId: key.callId), timeout: Self.refreshTimeout) { [self] answer in
-            fetched(answer, key: key, log: log)
+        let body = parts.grantOnlyBody(callId: key.callId)
+        guard let tokens = tokens else {
+            return request(url, json: body, timeout: Self.refreshTimeout) { [self] answer in fetched(answer, key: key, log: log) }
         }
+        tokens.send(body, refreshable: { (answer: RtcHTTPAnswer) in
+            guard case let .answered(status, data, _) = answer, status != 200 else { return false }
+            return GraineRtcTokens.refreshable(Self.code(data))
+        }, send: { [weak self] json, answer in
+            // The token may come on any thread: the request is this object's clock's.
+            self?.clock.run { self?.request(url, json: json, timeout: Self.refreshTimeout, done: answer) }
+        }, done: { [weak self] answer in
+            self?.clock.run { self?.fetched(answer, key: key, log: log) }
+        })
+    }
+
+    /// A refusal's code, as the web route names it; nil for none.
+    static func code(_ data: Data?) -> String? {
+        let object = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        return object?["code"] as? String
     }
 
     private func fetched(_ answer: RtcHTTPAnswer, key: GrantKey, log: ((String) -> Void)?) {
+        // Whatever became of it, the core hears what the web route said of the app and the user.
+        if case let .answered(status, data, _) = answer { hearing[key.slot]?(status, data) }
         // Still wanted? A request made for another customer while it was on its way is nobody's now.
         let forNext = askingNext[key.slot] == key
         if forNext { askingNext[key.slot] = nil }

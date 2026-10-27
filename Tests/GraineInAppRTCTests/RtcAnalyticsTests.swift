@@ -276,8 +276,12 @@ private let transportRow = GraineCallTelemetry.frame("transport", ["transport": 
         failed.engine.audioActivated()
         join(failed)
         failed.media.ice(.failed)
+        // 0.14.4: an ICE restart inside the call first; the WebSocket only once it failed, never before the 8 s deadline.
+        #expect(failed.media.reoffers == [true], "restarted at once")
+        #expect(!failed.names.contains { $0.hasPrefix("unreachable") })
+        failed.clock.advance(8.1)
         #expect(failed.names.last == "unreachable(ice_timeout)", "the fallback's reason is unchanged")
-        #expect(rows(failed).map(\.text) == [#"{"type":"app_event","event":{"name":"media","detail":"no audio path (ice_failed)","quiet":true,"telemetry":true,"data":{"reason":"ice_failed","transport":"rtc"}}}"#])
+        #expect(rows(failed).map(\.text) == [#"{"type":"app_event","event":{"name":"media","detail":"no audio path (ice_timeout)","quiet":true,"telemetry":true,"data":{"reason":"ice_timeout","transport":"rtc"}}}"#])
         #expect(failed.sockets.control.first?.closedByClient == true, "then it closes")
 
         let late = EngineRig(budget: 60)
@@ -285,7 +289,9 @@ private let transportRow = GraineCallTelemetry.frame("transport", ["transport": 
         late.engine.audioActivated()
         join(late)
         late.clock.advance(8.1)
-        #expect(rows(late).map(\.detail) == ["no audio path (ice_timeout)"])
+        #expect(rows(late).isEmpty, "8 s in: restarted, not handed over")
+        late.clock.advance(6)
+        #expect(rows(late).map(\.detail) == ["no audio path (ice_timeout)"], "the restart's 6 s window spent")
 
         let notJoined = EngineRig(budget: 60)
         notJoined.ready()
@@ -310,7 +316,7 @@ private let transportRow = GraineCallTelemetry.frame("transport", ["transport": 
         dropped.live()
         join(dropped)
         dropped.media.ice(.disconnected)
-        dropped.clock.advance(10.1)
+        dropped.clock.advance(15.1)             // 0.14.4: a restart 3 s in, given up after 15 s with a network
         #expect(dropped.names.last == "ended(dropped)")
         #expect(rows(dropped).last?.detail.hasPrefix("the audio path dropped after ") == true)
         #expect(rows(dropped).last?.data["cause"] as? String == "media_drop")

@@ -55,6 +55,10 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
     }
 
     var onIceState: ((RtcIceState) -> Void)?
+    /// The link's pace: a gathering's relay wait grows with it while no UDP path has shown up (IceGathering.cap).
+    var gatherPace = 1.0
+    /// What this peer gathered, by kind (`peerConnection(_:didGenerate:)`), on the clock.
+    private(set) var gathered = RtcGathered()
 
     private let clock: RtcClock
     private var peer: LKRTCPeerConnection?
@@ -69,6 +73,8 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
         var started: Double
         var cap: Double
         var wantRelay: Bool
+        /// A server-reflexive candidate arrived: UDP works, and the relay wait drops back to its base.
+        var sawSrflx = false
         var timer: RtcTimer?
         var done: (Result<String, RtcMediaError>) -> Void
     }
@@ -163,6 +169,12 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
         peer.statistics { report in
             var found: RtcInboundAudio?
             var codecId: String?
+            // What the speaker has been handed, from libwebrtc's own count — reported with or without a packet received.
+            var playout: Int?
+            for stat in report.statistics.values where stat.type == "media-playout" {
+                guard let count = (stat.values["totalSamplesCount"] as? NSNumber)?.intValue else { continue }
+                playout = (playout ?? 0) + count
+            }
             for stat in report.statistics.values where stat.type == "inbound-rtp" {
                 guard (stat.values["kind"] as? String ?? stat.values["mediaType"] as? String) == "audio" else { continue }
                 func number(_ key: String) -> Double { (stat.values[key] as? NSNumber)?.doubleValue ?? 0 }
@@ -175,8 +187,14 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
                     jitter: number("jitter"),
                     codec: nil
                 )
+                found?.samplesReceived = (stat.values["totalSamplesReceived"] as? NSNumber)?.intValue
                 codecId = stat.values["codecId"] as? String
             }
+            if found == nil, playout != nil {
+                found = RtcInboundAudio(audioLevel: 0, totalAudioEnergy: 0, bytesReceived: 0, packetsReceived: 0, packetsLost: 0, jitter: 0, codec: nil)
+                found?.inbound = false
+            }
+            found?.playoutSamples = playout
             if var audio = found, let id = codecId, let codec = report.statistics[id] {
                 audio.codec = codec.values["mimeType"] as? String
                 audio.clockRate = (codec.values["clockRate"] as? NSNumber)?.intValue
@@ -200,6 +218,49 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
     func setMuted(_ muted: Bool) {
         self.muted = muted
         track?.isEnabled = !muted
+    }
+
+    func forgetGathered() {
+        gathered = RtcGathered()
+    }
+
+    func iceStats(_ done: @escaping (RtcIceReading?) -> Void) {
+        guard let peer = peer else {
+            done(nil)
+            return
+        }
+        peer.statistics { [weak self] report in
+            var reading = RtcIceReading()
+            for stat in report.statistics.values {
+                func number(_ key: String) -> Int { (stat.values[key] as? NSNumber)?.intValue ?? 0 }
+                if stat.type == "candidate-pair" {
+                    reading.pairs += 1
+                    switch stat.values["state"] as? String {
+                    case "succeeded"?: reading.succeeded += 1
+                    case "in-progress"?: reading.inProgress += 1
+                    case "failed"?: reading.failed += 1
+                    default: break
+                    }
+                    reading.requestsSent += number("requestsSent")
+                    reading.responsesReceived += number("responsesReceived")
+                    reading.requestsReceived += number("requestsReceived")
+                } else if stat.type == "transport" {
+                    reading.dtlsState = stat.values["dtlsState"] as? String
+                    reading.bytesReceived += number("bytesReceived")
+                }
+            }
+            self?.clock.run { done(reading) }
+        }
+    }
+
+    func useServers(_ servers: [RtcIceServer], relayOnly: Bool) -> Bool {
+        guard let peer = peer else { return false }
+        let config = peer.configuration
+        config.iceServers = servers.map { LKRTCIceServer(urlStrings: $0.urls, username: $0.username, credential: $0.credential) }
+        config.iceTransportPolicy = relayOnly ? .relay : .all
+        guard peer.setConfiguration(config) else { return false }
+        self.servers = servers
+        return true
     }
 
     func close() {
@@ -246,19 +307,34 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
     /// On the clock: wait for the rule, then hand over the description as it stands, candidates inside.
     private func gather(_ done: @escaping (Result<String, RtcMediaError>) -> Void) {
         gathering?.timer?.cancel()
-        let cap = IceGathering.cap(for: servers)
-        var state = Gathering(started: clock.now, cap: cap, wantRelay: IceGathering.hasTurn(servers), done: done)
+        let wantRelay = IceGathering.hasTurn(servers)
+        let cap = IceGathering.cap(wantRelay: wantRelay, pace: gatherPace, sawSrflx: false)
+        var state = Gathering(started: clock.now, cap: cap, wantRelay: wantRelay, done: done)
         state.timer = clock.after(cap) { [weak self] in self?.endGathering() }
         gathering = state
         // The pool may have them already: judge what the description holds before waiting for more.
         for line in (peer?.localDescription?.sdp ?? "").components(separatedBy: "\n") where line.hasPrefix("a=candidate:") {
-            consider(IceGathering.kind(String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)))
+            let candidate = String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let kind = IceGathering.kind(candidate)
+            // Host and server-reflexive evidence only: a relay is counted from its own callback, which names its URL
+            // (pooled candidates are signalled too), so a relay seen only here never hides a UDP-blocked network.
+            if kind == .host || kind == .srflx { gathered.add(candidate) }
+            consider(kind)
         }
         if peer?.iceGatheringState == .complete { consider(.end) }
     }
 
     private func consider(_ kind: IceCandidateKind) {
-        guard let state = gathering else { return }
+        guard var state = gathering else { return }
+        if kind == .srflx && !state.sawSrflx && state.wantRelay {
+            // UDP works: the relay is a spare, and the wait drops back to the base relay cap.
+            state.sawSrflx = true
+            state.cap = IceGathering.cap(wantRelay: true, pace: gatherPace, sawSrflx: true)
+            state.timer?.cancel()
+            let left = max(0, state.cap - (clock.now - state.started))
+            state.timer = clock.after(left) { [weak self] in self?.endGathering() }
+            gathering = state
+        }
         if IceGathering.endNow(kind, elapsed: clock.now - state.started, cap: state.cap, wantRelay: state.wantRelay) {
             endGathering()
         }
@@ -305,7 +381,12 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
     }
 
     func peerConnection(_ peerConnection: LKRTCPeerConnection, didGenerate candidate: LKRTCIceCandidate) {
-        let kind = IceGathering.kind(candidate.sdp)
-        clock.run { [weak self] in self?.consider(kind) }
+        let line = candidate.sdp
+        let kind = IceGathering.kind(line)
+        let serverUrl = candidate.serverUrl
+        clock.run { [weak self] in
+            self?.gathered.add(line, serverUrl: serverUrl)
+            self?.consider(kind)
+        }
     }
 }

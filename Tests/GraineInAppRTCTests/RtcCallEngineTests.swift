@@ -18,6 +18,7 @@ final class EngineRig {
     let media = ScriptedMedia()
     let minting = ScriptedMinting()
     let audio = RecordingAudioControl()
+    let network = ScriptedNetwork()
     private(set) var events: [GraineRtcEvent] = []
     private(set) var mintSessionIds: [String] = []
     let engine: RtcCallEngine
@@ -38,7 +39,8 @@ final class EngineRig {
             random: CountingRandom(),
             makeMedia: { [media] _ in media },
             audio: audio,
-            direct: direct
+            direct: direct,
+            network: network
         )
         var ids: [String] = []
         let request = GraineRtcRequest(
@@ -104,6 +106,7 @@ final class EngineRig {
             case let .refused(code, _): return "refused(\(code))"
             case .ended(.remote): return "ended(remote)"
             case .ended(.dropped): return "ended(dropped)"
+            case .playoutFailed: return "playoutFailed"
             case .log: return nil
             }
         }
@@ -246,7 +249,14 @@ final class EngineRig {
         rig.openSip()
         #expect(rig.invites.count == 2, "dialled again")
         rig.clock.advance(4.1)
+        // 0.14.4: nothing back is the link's failure — a third dial, on another fresh connection, then the socket.
+        #expect(rig.sockets.sip.count == 3, "a third dial on a fresh connection")
+        #expect(rig.names == ["ready"])
+        rig.openSip()
+        #expect(rig.invites.count == 3)
+        rig.clock.advance(4.1)
         #expect(rig.names == ["ready", "unreachable(no_response)"])
+        #expect(rig.sockets.sip.count == 3, "never a fourth")
     }
 
     /// 16 Oct: the SBC said "trying" and the call never reached the agent, every other tap.
@@ -484,8 +494,14 @@ final class EngineRig {
         rig.media.ice(.checking)
         rig.clock.advance(7.9)
         #expect(!rig.names.contains { $0.hasPrefix("unreachable") })
+        #expect(rig.media.reoffers.isEmpty, "nothing done before the deadline")
         rig.clock.advance(0.2)
-        #expect(rig.names == ["ready", "unreachable(ice_timeout)"])
+        // 0.14.4: at the deadline an ICE restart inside the call — the WebSocket only once that failed.
+        #expect(rig.media.reoffers == [true], "an ICE restart at the deadline")
+        #expect(rig.sbc.received.filter { $0.method == "INVITE" && $0.toTag != nil }.count == 1, "in the answered dialog: never a new call")
+        #expect(!rig.names.contains { $0.hasPrefix("unreachable") })
+        rig.clock.advance(6)
+        #expect(rig.names == ["ready", "unreachable(ice_timeout)"], "the restart's window spent")
         #expect(rig.sbc.received.contains { $0.method == "BYE" }, "the answered call is ended on the SBC")
     }
 
@@ -566,13 +582,15 @@ final class EngineRig {
         rig.media.ice(.connected)
         rig.clock.advance(20)
         #expect(!rig.names.contains("ended(dropped)"), "back")
-        // Lost again: the restart was spent, so it is dropped when the path does not come back.
+        // Lost again (0.14.4): a loss of its own gets its own restart; dropped only 15 s in, with a network.
         rig.media.ice(.disconnected)
-        rig.clock.advance(9.9)
+        rig.clock.advance(3.1)
+        #expect(rig.media.reoffers == [true, true], "the second loss got its restart")
+        rig.clock.advance(11.8)
         #expect(!rig.names.contains("ended(dropped)"))
         rig.clock.advance(0.2)
         #expect(rig.names.last == "ended(dropped)")
-        #expect(rig.media.reoffers == [true])
+        #expect(rig.media.reoffers == [true, true], "no second restart for the same loss with nothing changed")
         #expect(rig.sbc.received.contains { $0.method == "BYE" })
     }
 
@@ -581,7 +599,7 @@ final class EngineRig {
         rig.live()
         rig.media.ice(.failed)
         #expect(rig.media.reoffers == [true])
-        rig.clock.advance(10.1)
+        rig.clock.advance(15.1)
         #expect(rig.names.last == "ended(dropped)", "never back")
     }
 
@@ -702,13 +720,15 @@ final class EngineRig {
         failed.engine.audioActivated()
         failed.media.ice(.checking)
         failed.media.ice(.failed)
+        // 0.14.4: restarted inside the call at once, handed over at the 8 s deadline — never "reconnecting".
+        failed.clock.advance(8.1)
         #expect(failed.names == ["ready", "unreachable(ice_timeout)"])
         #expect(failed.reconnecting.isEmpty)
         let lost = EngineRig()
         lost.ready()
         lost.engine.audioActivated()
         lost.media.ice(.disconnected)
-        lost.clock.advance(13)
+        lost.clock.advance(14.1)
         #expect(lost.reconnecting.isEmpty)
         #expect(lost.names.last?.hasPrefix("unreachable") == true)
         #expect(lost.levels.isEmpty, "no level before the media")
@@ -718,7 +738,7 @@ final class EngineRig {
         let dropped = EngineRig()
         dropped.live()
         dropped.media.ice(.disconnected)
-        dropped.clock.advance(10.1)
+        dropped.clock.advance(15.1)
         #expect(Array(dropped.names.suffix(2)) == ["reconnecting(false)", "ended(dropped)"], "false before the end")
         let remote = EngineRig()
         remote.live()
