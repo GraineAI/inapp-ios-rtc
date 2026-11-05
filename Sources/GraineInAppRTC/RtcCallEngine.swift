@@ -99,6 +99,9 @@ final class RtcCallEngine: GraineRtcCall {
     static let readyStableSeconds = 0.3
     /// Still nothing played this long after that restart: the call cannot be heard.
     static let playoutFailAfter = 3.0
+    /// WebRTC's audio unit would not start: asked again this often, this many times, while the greeting still waits for the audio.
+    static let unitRetrySeconds = 0.4
+    static let unitRetriesMax = 5
     /// After the route moves (a Bluetooth headset or car kit's hands-free link can take seconds), nothing is judged this long.
     static let routeSettleSeconds = 4.0
     /// At most this many `route_changed` rows per call: a flapping headset says enough by then.
@@ -208,6 +211,9 @@ final class RtcCallEngine: GraineRtcCall {
     private var playoutRestartedAt: Double?
     private var audioReady = false
     private var playoutFailed = false
+    /// How often WebRTC's audio unit has been asked again, and when last.
+    private var unitRetries = 0
+    private var unitRetriedAt: Double?
     /// Since when the playout counts have moved in every reading with this call's audio on: the audio is said ready
     /// only once that has lasted `readyStableSeconds`. Nil until they move, and again whenever they stop or the audio goes.
     private var playingSince: Double?
@@ -1119,10 +1125,12 @@ final class RtcCallEngine: GraineRtcCall {
             playingSince = since
             guard !audioReady || readyAgainBecause != nil, now - since >= Self.readyStableSeconds - 1e-9 else { return }
             let again = readyAgainBecause
+            // The first time, after WebRTC's audio unit had to be asked again: its row says so.
+            let firstAfterRetry = !audioReady && unitRetries > 0
             audioReady = true
             readyAgainBecause = nil
             control?.send(GraineRtcSignal.audioReady, kind: nil)
-            sendAudioRow("ready", reason: again)
+            sendAudioRow("ready", reason: again ?? (firstAfterRetry ? "unit_failed" : nil))
             trace(again.map { "audio: playing again after it was lost (\($0)) — the channel told it is ready again" }
                   ?? "audio: playing steadily (\(audioVia)) — the channel told it is ready")
             return
@@ -1134,6 +1142,15 @@ final class RtcCallEngine: GraineRtcCall {
         if let until = settleUntil {
             guard now >= until - 1e-9 else { return }
             settleUntil = nil
+        }
+        // WebRTC's audio unit would not start, and it never asks again (RtcAudioGate): asked here, at once, not after the
+        // stall's two seconds, so the call's first words are still to come when it runs.
+        if audioOn, unitRetries < Self.unitRetriesMax, parts.audio.stallCause() == "unit_failed",
+           now - (unitRetriedAt ?? -Double.infinity) >= Self.unitRetrySeconds - 1e-9 {
+            unitRetries += 1
+            unitRetriedAt = now
+            trace("audio: WebRTC's audio unit would not start — asking again (\(unitRetries))")
+            parts.audio.retryAudioUnit()
         }
         let elapsed = now - before.at
         // Audio arrived, and the receiver counted none of it played.

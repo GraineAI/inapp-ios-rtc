@@ -36,6 +36,15 @@ import os.log
  * activated here as the rescue activates it. What WebRTC reported meanwhile
  * (an interruption, an audio unit that would not start) is the restart's
  * reason, for the call's `audio` row.
+ *
+ * WEBRTC FORGETS A START THAT FAILED (`retryAudioUnit`, `restart`). When
+ * AudioOutputUnitStart fails, its audio device module returns without marking
+ * playout or recording as started, and only a new stream would ask again.
+ * Turning the audio off and on starts the unit only for what the module
+ * believes is started, so on its own that can never bring this call back: the
+ * call connects, media flows, nothing plays and the agent hears nothing (one
+ * iPhone, 7 of 8 calls on 5 Nov 2026, `unit_failed`). So the module is asked
+ * directly, for what it does not believe is running.
  */
 final class RtcAudioGate: RtcAudioControl {
     static let shared = RtcAudioGate()
@@ -92,8 +101,24 @@ final class RtcAudioGate: RtcAudioControl {
         // Balanced: the activation below tells WebRTC the session is active again, and ends any interruption it holds.
         if session.isActive { session.audioSessionDidDeactivate(AVAudioSession.sharedInstance()) }
         guard activateHere() else { return false }
+        startModule()
         Self.note("audio arrived and nothing played: WebRTC's audio was started again.")
         return true
+    }
+
+    func retryAudioUnit() {
+        reports.unitFailed = false
+        startModule()
+        Self.note("WebRTC's audio unit would not start: asked again.")
+    }
+
+    /// Whatever the audio device module does not believe is running, started: on its own thread, in order after an `enable`.
+    private func startModule() {
+        let module = WebRTCMedia.factory().audioDeviceModule
+        if !module.isPlayoutInitialized { _ = module.initPlayout() }
+        if !module.isPlaying { _ = module.startPlayout() }
+        if !module.isRecordingInitialized { _ = module.initRecording() }
+        if !module.isRecording { _ = module.startRecording() }
     }
 
     /**

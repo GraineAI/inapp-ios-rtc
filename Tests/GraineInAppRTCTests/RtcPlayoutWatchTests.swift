@@ -43,6 +43,81 @@ private func unheard(_ rig: EngineRig) -> [String] {
 }
 
 @Suite struct RtcPlayoutWatchTests {
+    // WebRTC never asks again after its audio unit would not start, and turning the audio off and on starts it only for
+    // what it believes is started (RtcAudioGate): one iPhone, 7 of 8 calls on 5 Nov 2026, `unit_failed`, then `no_playout`.
+    @Test func anAudioUnitThatWouldNotStartIsAskedAgainAtOnceAndTheCallThenPlays() throws {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.level.samplesReceived = 0
+        rig.media.level.playoutSamples = 0
+        rig.audio.cause = "unit_failed"
+        rig.audio.clearsCauseOnRetry = true
+        readings(rig, for: 0.6, samples: 0, packets: 10, playout: 0)
+        #expect(rig.audio.steps.filter { $0 == "retry unit" }.count == 1, "asked again, once it has said so")
+        #expect(!rig.audio.steps.contains("restart"), "long before the stall's two seconds")
+        join(rig)
+        readings(rig, for: 1, samples: 1_600, packets: 10)
+        let control = try #require(rig.sockets.control.first)
+        #expect(control.sent.filter { $0 == GraineRtcSignal.audioReady }.count == 1, "the greeting goes out")
+        #expect(unheard(rig).isEmpty, "and the call lives")
+        #expect(!rig.audio.steps.contains("restart"))
+        #expect(events(rig) == ["ready"], "one row")
+        #expect(JSON.string(audioRows(rig).last?["reason"]) == "unit_failed", "which says what it took")
+    }
+
+    @Test func itKeepsAskingABoundedNumberOfTimesThenTheStallsRulesStand() {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.level.samplesReceived = 0
+        rig.media.level.playoutSamples = 0
+        rig.audio.cause = "unit_failed"
+        join(rig)
+        readings(rig, for: 8, samples: 0, packets: 10, playout: 0)
+        #expect(rig.audio.steps.filter { $0 == "retry unit" }.count == RtcCallEngine.unitRetriesMax)
+        #expect(rig.audio.steps.filter { $0 == "restart" }.count == 1, "the stall's one restart")
+        #expect(unheard(rig).count == 1, "still nothing: the call cannot be heard, as before")
+    }
+
+    @Test func anythingButAUnitThatWouldNotStartIsNotAskedAgain() {
+        for cause in [nil, "interrupted", "disabled", "inactive"] as [String?] {
+            let rig = EngineRig()
+            rig.live()
+            rig.media.level.samplesReceived = 0
+            rig.media.level.playoutSamples = 0
+            rig.audio.cause = cause
+            readings(rig, for: 1.5, samples: 0, packets: 10, playout: 0)
+            #expect(!rig.audio.steps.contains("retry unit"), "\(cause ?? "no cause")")
+        }
+    }
+
+    // The agent's greeting is spoken once: the channel hears "ready" once, whatever it takes to get the audio going.
+    @Test func askingAgainNeverTellsTheChannelReadyASecondTime() throws {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.level.samplesReceived = 0
+        rig.media.level.playoutSamples = 0
+        join(rig)
+        readings(rig, for: 1, samples: 1_600, packets: 10)
+        let control = try #require(rig.sockets.control.first)
+        #expect(control.sent.filter { $0 == GraineRtcSignal.audioReady }.count == 1)
+        // The unit stops mid-call and is asked again; it plays again.
+        rig.audio.cause = "unit_failed"
+        rig.audio.clearsCauseOnRetry = true
+        readings(rig, for: 0.6, samples: 0, packets: 10, playout: 0)
+        #expect(rig.audio.steps.contains("retry unit"))
+        readings(rig, for: 2, samples: 1_600, packets: 10)
+        #expect(control.sent.filter { $0 == GraineRtcSignal.audioReady }.count == 1, "never a second time, so nothing is replayed")
+        #expect(unheard(rig).isEmpty)
+    }
+
+    @Test func aHealthyCallIsNeverAskedAgain() {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.level.samplesReceived = 0
+        readings(rig, for: 3, samples: 1_600, packets: 10)
+        #expect(!rig.audio.steps.contains("retry unit") && !rig.audio.steps.contains("restart"))
+    }
+
     @Test func aCallWhosePlayoutRunsSaysItsAudioIsReadyOnce() throws {
         let rig = EngineRig()
         rig.live()

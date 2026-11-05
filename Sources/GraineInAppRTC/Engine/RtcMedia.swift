@@ -136,6 +136,11 @@ protocol RtcAudioControl: AnyObject {
      * when it would not start.
      */
     func restart() -> Bool
+    /**
+     * WebRTC's audio unit would not start (`stallCause` says `unit_failed`), and
+     * WebRTC does not try again by itself: ask for it again, now.
+     */
+    func retryAudioUnit()
     /// Why nothing plays, as far as the audio session can tell — an `audio` row's reason (`interrupted`, `unit_failed`, `disabled`, `inactive`) — or nil.
     func stallCause() -> String?
     /**
@@ -155,6 +160,7 @@ final class NoAudioControl: RtcAudioControl {
     func startDirectly() -> Bool { true }
     func deactivated() {}
     func restart() -> Bool { true }
+    func retryAudioUnit() {}
     func stallCause() -> String? { nil }
     func watchRoute(_ heard: @escaping (RtcAudioRouteEvent) -> Void) -> () -> Void { {} }
     func callEnds() {}

@@ -373,6 +373,9 @@ final class RecordingAudioControl: RtcAudioControl {
     func startDirectly() -> Bool { steps.append("direct"); return directStarts }
     func deactivated() { steps.append("deactivated") }
     func restart() -> Bool { steps.append("restart"); return restarts }
+    func retryAudioUnit() { steps.append("retry unit"); if clearsCauseOnRetry { cause = nil } }
+    /// The retry worked: the session has nothing more to say of a stall.
+    var clearsCauseOnRetry = false
     func stallCause() -> String? { cause }
     /// Who hears the route now (the live call), so a test can move it.
     private(set) var routeWatcher: ((RtcAudioRouteEvent) -> Void)?
