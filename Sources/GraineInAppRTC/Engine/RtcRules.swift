@@ -16,6 +16,31 @@ enum IceCandidateKind: String {
     case host, srflx, prflx, relay, end, unknown
 }
 
+/**
+ * WHAT THIS APP LEARNED ABOUT DIALLING AHEAD OF THE REGISTRATION, while it runs:
+ * the SBC itself refused a dial that went before its registration had answered.
+ * Calls then register first, as they always did, so the failed dial and its
+ * redial are paid once at most.
+ */
+final class RtcDialMemory {
+    static let shared = RtcDialMemory()
+    private let lock = NSLock()
+    private var first = false
+
+    var registrationFirst: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return first
+        }
+        set {
+            lock.lock()
+            first = newValue
+            lock.unlock()
+        }
+    }
+}
+
 enum IceGathering {
     /// A public candidate arrives in tens of milliseconds; this is fifteen times that.
     static let capSeconds = 1.5

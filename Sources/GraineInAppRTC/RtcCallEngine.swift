@@ -13,10 +13,16 @@ import Foundation
  *   begin     the control channel opens (the server holds it until the call
  *             exists) and, once the mint has answered, the attempt's budget
  *             starts: 12 s to media, or the call is the WebSocket's
- *   audio     CallKit activated the session (or, failing that, it was started
- *             directly): only now does the INVITE leave, so the greeting is
- *             never played into a session that is not running
- *   dial      INVITE with X-Graine-Session-Id, X-Graine-Agent-Id and
+ *   dial      a call the customer tapped: as soon as the offer is made and the
+ *             SIP socket is open: neither the registration (it goes on beside
+ *             the dial, and the SBC challenges the INVITE itself) nor the audio
+ *             (below) is waited for. A dial sent ahead of its registration that
+ *             fails is made once more on a fresh connection, registered first,
+ *             and this app then registers first from there on (`RtcDialMemory`).
+ *             A call the person answered, however long it rang: only once they
+ *             have picked up (`begin`), it is registered and its audio runs —
+ *             the order of every booked call since the first, kept whole.
+ *             INVITE with X-Graine-Session-Id, X-Graine-Agent-Id and
  *             X-Application-Sid; no reply within the link's own pace, or no
  *             answer within 15 s, and the dial has failed — a network-ish
  *             failure gets one more dial on a fresh connection (the link's own
@@ -27,6 +33,10 @@ import Foundation
  *             link's pace (longer while it is still making progress), then an
  *             ICE restart inside the call — never a new call — and the
  *             WebSocket only once that has failed, never before the deadline
+ *   audio     CallKit activates the session (or, failing that, it is started
+ *             directly), whenever that lands around a tapped call's dial: the agent's
+ *             greeting waits for this phone to say its audio plays (`playout`),
+ *             so it is never played into a session that is not running
  *   live      the media watched (RtcMediaRecovery): a path lost is restarted
  *             3 s in (at once on failed), never into no network — offline time
  *             is not counted — and the call is dropped only after 15 s × pace
@@ -34,7 +44,8 @@ import Foundation
  *             `reconnecting` (the call screen's moment); the receiver's level
  *             is reported five times a second
  *   playout   the speaker watched too (`watchPlayout`): the audio activated
- *             and the phone's playout running steadily (0.3 s), the control
+ *             and the phone's playout running steadily (0.3 s; 0.1 s for a tapped
+ *             call when no call has just ended), the control
  *             channel hears {"type":"audio","state":"ready"} — the agent's
  *             greeting waits for it, and it is said again when the audio
  *             comes back after it was lost; audio arriving with nothing played for 2 s, the
@@ -61,6 +72,10 @@ final class RtcCallEngine: GraineRtcCall {
         var direct: RtcDirectMint? = nil
         /// Whether the phone has a network, and when that changes (Engine/RtcNetwork.swift).
         var network: RtcNetwork = SteadyRtcNetwork()
+        /// How often the audio is read while the call's first words are awaited (`startLevelSeconds`).
+        var startReadingEvery: Double = RtcCallEngine.startLevelSeconds
+        /// What this app learned about dialling ahead of the registration.
+        var dialMemory: RtcDialMemory = .shared
 
         static func production() -> Parts {
             #if os(iOS)
@@ -87,6 +102,13 @@ final class RtcCallEngine: GraineRtcCall {
     static let quietSeconds = 0.5
     /// Five readings a second.
     static let levelSeconds = 0.2
+    /**
+     * A call the customer tapped: until the audio is said ready and the agent's first words are heard, a reading this
+     * often, for at most `startLevelFor` after media: the greeting waits for the first of them, so a step of
+     * `levelSeconds` was a step of the silence after the tap. Just over the 50 ms libwebrtc keeps a stats report for.
+     */
+    static let startLevelSeconds = 0.06
+    static let startLevelFor = 5.0
     /// The audio so far goes up to the SDK about this often (GraineRtcEvent.audio).
     static let audioReportSeconds = 1.0
     /// Audio arriving with nothing played this long: the phone's audio is started again, once.
@@ -94,9 +116,14 @@ final class RtcCallEngine: GraineRtcCall {
     /**
      * The audio is said ready (the agent's greeting waits for it) only once its playout has run this long, steadily,
      * with the call's audio on. A deactivation that lands just after the audio started — the call before's, on a
-     * redial within a second — is seen before the greeting goes, not after it is cut.
+     * redial within a second — is seen before the greeting goes, not after it is cut: every call the person answered
+     * keeps that wait, and a tapped call when a call with audio has just ended (`RtcAudioControl.endedMomentsAgo`).
+     * Otherwise a moment is enough to know the audio unit runs: audio that never started never moves these counts at all.
      */
     static let readyStableSeconds = 0.3
+    static let readyStableTappedSeconds = 0.1
+    /// A reading this soon after the counts last moved fell between two of libwebrtc's reports: not a stop.
+    static let stillToleranceSeconds = 0.15
     /// Still nothing played this long after that restart: the call cannot be heard.
     static let playoutFailAfter = 3.0
     /// WebRTC's audio unit would not start: asked again this often, this many times, while the greeting still waits for the audio.
@@ -136,6 +163,8 @@ final class RtcCallEngine: GraineRtcCall {
     /// Prepared ahead of the tap, and the transport row to send at media — said by the call that dials it; under `sinkLock`.
     private var aheadOfTap = false
     private var openingRow: String?
+    private var tapAgo = 0.0
+    private var followsACall = false
     // For the analytics rows (GraineCallTelemetry): ready when it was begun, the last INVITE, the first
     // registration, a heal under way, the media's numbers.
     private var readyAtTap = false
@@ -154,6 +183,12 @@ final class RtcCallEngine: GraineRtcCall {
     private var ua: SipUserAgent?
     private var uaGeneration = 0
     private var registered = false
+    /// The SIP socket is open: a dial can go, with its registration beside it.
+    private var sipOpen = false
+    /// The dial in flight went ahead of its registration: failing, it is made once more, registered first.
+    private var dialledAhead = false
+    /// `.ready` was said: once, whichever comes first — ready with the registration, or dialling ahead of it.
+    private var saidReady = false
     private var registerSeconds: Double?
     private var registerTimer: RtcTimer?
     private var begun = false
@@ -217,6 +252,8 @@ final class RtcCallEngine: GraineRtcCall {
     /// Since when the playout counts have moved in every reading with this call's audio on: the audio is said ready
     /// only once that has lasted `readyStableSeconds`. Nil until they move, and again whenever they stop or the audio goes.
     private var playingSince: Double?
+    /// When the counts last moved.
+    private var lastGrewAt: Double?
     /// When this call's audio last came on (CallKit, a direct start, a restart): a steady stretch never starts before it.
     private var audioOnSince: Double?
     /// Ready was said, then the audio was lost — taken back, or stalled and restarted: it is said again once it plays
@@ -295,6 +332,32 @@ final class RtcCallEngine: GraineRtcCall {
         }
     }
 
+    var tapAgoSeconds: Double {
+        get {
+            sinkLock.lock()
+            defer { sinkLock.unlock() }
+            return tapAgo
+        }
+        set {
+            sinkLock.lock()
+            tapAgo = newValue
+            sinkLock.unlock()
+        }
+    }
+
+    var afterACall: Bool {
+        get {
+            sinkLock.lock()
+            defer { sinkLock.unlock() }
+            return followsACall
+        }
+        set {
+            sinkLock.lock()
+            followsACall = newValue
+            sinkLock.unlock()
+        }
+    }
+
     func prepare() {
         clock.run { [self] in
             guard phase == .idle else { return }
@@ -321,6 +384,7 @@ final class RtcCallEngine: GraineRtcCall {
             guard !begun, phase != .ended else { return }
             begun = true
             mark("begin")
+            marks["tap"] = clock.now - max(0, tapAgoSeconds)
             // Set up and registered before the tap — a prepared call's connect row says so.
             readyAtTap = phase == .ready && !redialing
             control?.open()
@@ -374,8 +438,9 @@ final class RtcCallEngine: GraineRtcCall {
             parts.audio.deactivated()
             audioOn = false
             playingSince = nil
-            // Once the call is under way: an interruption, not its end — the SDK starts the audio again if CallKit does not.
-            guard phase >= .dialing else { return }
+            // Once the call is under way and has had its audio: an interruption, not its end — the SDK starts the audio again
+            // if CallKit does not. Before this call's audio ever came on, it is the call before's, and nobody's here.
+            guard phase >= .dialing, audioOnSince != nil else { return }
             deactivatedLive = true
             // Said ready already: whatever played since may not have been heard — said again once it plays.
             if audioReady { readyAgainBecause = "deactivated" }
@@ -385,6 +450,12 @@ final class RtcCallEngine: GraineRtcCall {
 
     /// The call's audio is on — from now, when it was off: a steady stretch of playout is counted from here.
     private func audioCameOn() {
+        // A tapped call can be live before its audio comes on, and hear an interruption there that no end ever follows
+        // (RtcAudioGate): the audio coming on is its end, or the playout watch would stand aside for the rest of the call.
+        if !request.answering, interrupted {
+            interrupted = false
+            freshCounts()
+        }
         if !audioOn {
             audioOnSince = clock.now
             playingSince = nil
@@ -572,6 +643,7 @@ final class RtcCallEngine: GraineRtcCall {
             mark("offer")
             trace("offer ready after \(ms(since: "minted")) ms")
             becomeReady()
+            dialIfReady()
         case .failure(let error):
             giveUp(.error, "the offer could not be made: \(error)")
         }
@@ -583,6 +655,7 @@ final class RtcCallEngine: GraineRtcCall {
         uaGeneration += 1
         let generation = uaGeneration
         registered = false
+        sipOpen = false
         let identity = SipUserAgent.identity(
             username: credential.username,
             realm: credential.realm,
@@ -605,7 +678,8 @@ final class RtcCallEngine: GraineRtcCall {
         ua = agent
         registerTimer?.cancel()
         registerTimer = clock.after(DialRules.registerDeadline) { [weak self] in
-            guard let self = self, generation == self.uaGeneration, !self.registered, self.phase < .live else { return }
+            // A dial already out decides for itself: its own deadlines run.
+            guard let self = self, generation == self.uaGeneration, !self.registered, self.phase < .dialing else { return }
             self.giveUp(.registerFailed, "the registration was not answered within \(Int(DialRules.registerDeadline)) s")
         }
         mark("sip_connect")
@@ -616,11 +690,14 @@ final class RtcCallEngine: GraineRtcCall {
         switch event {
         case .connected:
             mark("sip_open")
+            sipOpen = true
             // The SIP socket came back under an answered call: replaced.
             if let lost = sipLostAt, phase >= .answered {
                 sipLostAt = nil
                 sendRecoveryRow("socket_replaced", since: lost)
             }
+            // The dial does not wait for the registration this socket is about to make.
+            dialIfReady()
 
         case .registered(let seconds):
             registered = true
@@ -637,13 +714,16 @@ final class RtcCallEngine: GraineRtcCall {
             // A fresh connection made before the offer was ready waits for it like the first one did.
             if phase == .preparing {
                 becomeReady()
-            } else {
-                phase = .ready
+            } else if phase == .ready {
                 dialIfReady()
             }
+            // Dialling or further: the dial went ahead of this answer, and nothing changes.
 
         case .registrationFailed(let failure):
-            guard phase < .live else { return }
+            guard phase < .dialing else {
+                // The dial out decides: the SBC challenges the INVITE itself.
+                return trace("sip: the registration was refused (\(describe(failure))) with the dial already out")
+            }
             giveUp(.registerFailed, "the registration was refused (\(describe(failure)))")
 
         case .transportLost(let detail):
@@ -776,13 +856,39 @@ final class RtcCallEngine: GraineRtcCall {
         phase = .ready
         mark("ready")
         trace("ready in \(ms(since: nil)) ms")
-        emit(.ready)
+        sayReady()
         notePrepared(.ready(milliseconds: ms(since: nil), direct: mintedDirect))
         dialIfReady()
     }
 
+    private func sayReady() {
+        guard !saidReady else { return }
+        saidReady = true
+        emit(.ready)
+    }
+
+    /**
+     * A TAPPED CALL WAITS FOR NOTHING IT DOES NOT NEED: the offer and an open
+     * socket. Not the registration — it goes on beside the dial, the SBC challenges
+     * the INVITE itself and answers it in a fraction of the registration's time. Not
+     * the audio — the greeting waits for this phone's word that it plays. A redial
+     * and an app that was refused ahead of its registration register first.
+     *
+     * A CALL THE PERSON ANSWERED KEEPS ITS ORDER, however long it rang: nothing goes
+     * before they pick up (`begun`), then the audio, then the INVITE, registered.
+     * It is the path where the audio came late (a push, the lock screen, CallKit).
+     */
     private func dialIfReady() {
-        guard phase == .ready, begun, audioOn, !redialing, !offerStale, let offer = offer, let ua = ua, let credential = credential else { return }
+        guard begun, !redialing, !offerStale, let offer = offer, let ua = ua, let credential = credential else { return }
+        if request.answering, !audioOn { return }
+        let ahead = phase == .preparing && sipOpen && !request.answering && !parts.dialMemory.registrationFirst
+        guard phase == .ready || ahead else { return }
+        dialledAhead = ahead
+        // Dialling ahead of the registration: what `.ready` starts (the audio's watch) starts now.
+        if ahead {
+            trace("dial: not waiting for the registration")
+            sayReady()
+        }
         phase = .dialing
         dials += 1
         dialSeq += 1
@@ -812,6 +918,19 @@ final class RtcCallEngine: GraineRtcCall {
         answerClock?.cancel()
         answerClock = nil
         let why = Self.describe(cause: cause, code: code)
+        if dialledAhead, DialRules.verdict(cause: cause, code: code, dialsSoFar: dials) != .ignore {
+            // Sent ahead of its registration: once more the way it always went, and that dial is not counted. Refused by
+            // the SBC itself, this app registers first from now on, so the wait is never paid twice.
+            dialledAhead = false
+            if code != nil { parts.dialMemory.registrationFirst = true }
+            trace("dial: \(why) ahead of the registration — dialling once more, registered first")
+            dials -= 1
+            dialSeq += 1
+            phase = .ready
+            freshConnection(after: why, fallback: Self.reason(cause: cause), allowance: freshConnections + 1)
+            freshConnections -= 1
+            return
+        }
         switch DialRules.verdict(cause: cause, code: code, dialsSoFar: dials) {
         case .ignore:
             return
@@ -936,7 +1055,13 @@ final class RtcCallEngine: GraineRtcCall {
 
     /// The link's pace (RtcPace): its registration and its media round trip; 1 when nothing was measured.
     private func pace() -> Double {
-        RtcPace.of(registerSeconds: registerSeconds, roundTripSeconds: mediaRoundTrip)
+        // A tapped call dialling ahead of its registration has measured only its socket, about half of what a registration
+        // takes: a slow link must not read as a good one, or one delayed packet redials a healthy call.
+        var register = registerSeconds
+        if register == nil, !request.answering, let connect = marks["sip_connect"], let open = marks["sip_open"], open > connect {
+            register = (open - connect) * 2
+        }
+        return RtcPace.of(registerSeconds: register, roundTripSeconds: mediaRoundTrip)
     }
 
     private func budgetSpent() {
@@ -1028,7 +1153,9 @@ final class RtcCallEngine: GraineRtcCall {
     /// "Agent speaking", from what the receiver plays: five readings a second.
     private func pollLevel() {
         levelTimer?.cancel()
-        levelTimer = clock.after(Self.levelSeconds) { [weak self] in
+        let starting = !request.answering && !(audioReady && marks["first_voice"] != nil)
+            && clock.now - (marks["connected"] ?? clock.now) < Self.startLevelFor
+        levelTimer = clock.after(starting ? parts.startReadingEvery : Self.levelSeconds) { [weak self] in
             guard let self = self, self.phase == .live, let media = self.media else { return }
             media.inboundAudio { stats in
                 self.clock.run {
@@ -1116,6 +1243,7 @@ final class RtcCallEngine: GraineRtcCall {
             unplayedFor = 0
             stillFor = 0
             playoutRestartedAt = nil
+            lastGrewAt = now
             guard audioOn else {
                 playingSince = nil
                 return
@@ -1123,7 +1251,8 @@ final class RtcCallEngine: GraineRtcCall {
             // Playing since the last reading — never since before the audio came on.
             let since = playingSince ?? max(before.at, audioOnSince ?? before.at)
             playingSince = since
-            guard !audioReady || readyAgainBecause != nil, now - since >= Self.readyStableSeconds - 1e-9 else { return }
+            let stable = request.answering || parts.audio.endedMomentsAgo || afterACall ? Self.readyStableSeconds : Self.readyStableTappedSeconds
+            guard !audioReady || readyAgainBecause != nil, now - since >= stable - 1e-9 else { return }
             let again = readyAgainBecause
             // The first time, after WebRTC's audio unit had to be asked again: its row says so.
             let firstAfterRetry = !audioReady && unitRetries > 0
@@ -1135,8 +1264,10 @@ final class RtcCallEngine: GraineRtcCall {
                   ?? "audio: playing steadily (\(audioVia)) — the channel told it is ready")
             return
         }
-        // The counts stood still: a steady stretch starts over.
-        playingSince = nil
+        // The counts stood still: a steady stretch starts over (a reading between two of libwebrtc's reports is no stop).
+        if lastGrewAt.map({ now - $0 >= Self.stillToleranceSeconds }) ?? true { playingSince = nil }
+        // This call's audio has not come on yet: the dial does not wait for it, and CallAudioWatch is on it. Nothing to judge.
+        guard audioOnSince != nil else { return }
         // While the system holds the audio, or the route settles, nothing is judged: the readings only keep the baseline.
         if interrupted { return }
         if let until = settleUntil {
@@ -1228,6 +1359,7 @@ final class RtcCallEngine: GraineRtcCall {
         stillFor = 0
         lastPlayout = nil
         playingSince = nil
+        lastGrewAt = nil
     }
 
     /// Nothing judged for `routeSettleSeconds`; a restart already made is judged from the end of it.
@@ -1326,6 +1458,9 @@ final class RtcCallEngine: GraineRtcCall {
         emit(.row(frame))
     }
 
+    /// The customer's tap: the call's own start less how long the tap took to reach it (`tapAgoSeconds`).
+    private var tappedAt: Double { marks["tap"] ?? marks["begin"] ?? startedAt }
+
     private func span(_ from: Double?, _ to: Double?) -> Int? {
         GraineCallTelemetry.milliseconds(from: from, to: to)
     }
@@ -1359,7 +1494,7 @@ final class RtcCallEngine: GraineRtcCall {
     private func sendConnectRow() {
         if let row = transportRow { sendRow(row) }
         let prepared = preparedAhead && readyAtTap
-        let tap = marks["begin"] ?? startedAt
+        let tap = tappedAt
         let answered = marks["answered"] ?? clock.now
         let invite = lastInviteAt ?? marks["invite"] ?? answered
         let setup = span(tap, invite), dial = span(invite, answered)
@@ -1385,7 +1520,7 @@ final class RtcCallEngine: GraineRtcCall {
     private func sendVoiceRow(_ stats: RtcInboundAudio) {
         let voice = marks["first_voice"] ?? clock.now
         sendRow("voice", [
-            "tap_to_voice_ms": span(marks["begin"] ?? startedAt, voice),
+            "tap_to_voice_ms": span(tappedAt, voice),
             "answer_to_voice_ms": span(marks["answered"], voice),
             "first_audio_ms": span(marks["answered"], marks["first_packet"]),
             "codec": stats.codecName,
@@ -1401,7 +1536,7 @@ final class RtcCallEngine: GraineRtcCall {
     /// The phone's audio when it matters (GraineCallTelemetry.audioFrame): ready once, and each exception — from the tap.
     private func sendAudioRow(_ event: String, reason: String?, route: String? = nil) {
         let frame = GraineCallTelemetry.audioFrame(event: event, transport: "rtc", via: audioVia, reason: reason,
-                                                   afterMs: span(marks["begin"] ?? startedAt, clock.now), route: route)
+                                                   afterMs: span(tappedAt, clock.now), route: route)
         if let frame = frame { sendRow(frame) }
     }
 

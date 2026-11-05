@@ -13,8 +13,11 @@ import os.log
  * be played into a session that is not running (and lost). So, while a WebRTC
  * call is live, WebRTC's audio is manual and off until CallKit activates the
  * session; then it is told so, configured for a call (play and record, voice
- * chat, Bluetooth headsets) inside its own lock, and enabled — and only then
- * does the INVITE leave. Manual audio only while the call lasts: an app that
+ * chat, Bluetooth headsets) inside its own lock, and enabled. A call the person
+ * answered dials only then; a call they tapped does not wait, as the greeting
+ * waits for this phone's word that its audio plays, and WebRTC's audio then
+ * starts once, here, rather than starting and restarting to add the microphone.
+ * Manual audio only while the call lasts: an app that
  * uses the same library for something else gets its settings back — once the
  * last leg holding the gate lets it go (a call prepared before the tap, a
  * ring's, another agent's may overlap).
@@ -44,7 +47,10 @@ import os.log
  * believes is started, so on its own that can never bring this call back: the
  * call connects, media flows, nothing plays and the agent hears nothing (one
  * iPhone, 7 of 8 calls on 5 Nov 2026, `unit_failed`). So the module is asked
- * directly, for what it does not believe is running.
+ * directly, for what it does not believe is running. And when it believes both
+ * are running (a tapped call: asked for before the audio came on, so the unit's
+ * first start was the audio's coming on, and that is what failed), only the audio
+ * going off and on starts the unit again, and a retry does that first.
  */
 final class RtcAudioGate: RtcAudioControl {
     static let shared = RtcAudioGate()
@@ -57,6 +63,11 @@ final class RtcAudioGate: RtcAudioControl {
     private var holders = 0
     /// The session was activated here (the rescue), not by CallKit: it is let go of here.
     private var activatedHere = false
+    /// A call activated the audio since the gate last saw a call end; when a call that had its audio last ended (uptime).
+    private var hadAudio = false
+    private var audioCallEndedAt: TimeInterval?
+    /// How long after such an end its deactivation may still land.
+    private static let lateDeactivationSeconds: TimeInterval = 5
     /// What WebRTC says of the session as it goes: held strongly here, as WebRTC holds its delegates weakly.
     private let reports = RtcAudioSessionReports()
 
@@ -84,7 +95,15 @@ final class RtcAudioGate: RtcAudioControl {
         session.isAudioEnabled = false
     }
 
+    var endedMomentsAgo: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let ended = audioCallEndedAt else { return false }
+        return ProcessInfo.processInfo.systemUptime - ended < Self.lateDeactivationSeconds
+    }
+
     func activated() {
+        noteAudio()
         session.audioSessionDidActivate(AVAudioSession.sharedInstance())
         configure()
         enable()
@@ -108,6 +127,8 @@ final class RtcAudioGate: RtcAudioControl {
 
     func retryAudioUnit() {
         reports.unitFailed = false
+        let module = WebRTCMedia.factory().audioDeviceModule
+        if module.isPlaying && module.isRecording { enable() }
         startModule()
         Self.note("WebRTC's audio unit would not start: asked again.")
     }
@@ -155,6 +176,7 @@ final class RtcAudioGate: RtcAudioControl {
 
     /// The session activated here, on AVAudioSession itself, and WebRTC told as CallKit's activation tells it; its audio enabled afresh.
     private func activateHere() -> Bool {
+        noteAudio()
         let audio = AVAudioSession.sharedInstance()
         session.lockForConfiguration()
         do {
@@ -180,9 +202,19 @@ final class RtcAudioGate: RtcAudioControl {
         session.isAudioEnabled = false
     }
 
+    private func noteAudio() {
+        lock.lock()
+        hadAudio = true
+        lock.unlock()
+    }
+
     func callEnds() {
         lock.lock()
         defer { lock.unlock() }
+        if hadAudio {
+            hadAudio = false
+            audioCallEndedAt = ProcessInfo.processInfo.systemUptime
+        }
         holders = max(0, holders - 1)
         guard holders == 0 else { return }
         session.isAudioEnabled = false

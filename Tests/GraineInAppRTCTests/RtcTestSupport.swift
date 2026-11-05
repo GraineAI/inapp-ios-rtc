@@ -363,6 +363,8 @@ final class ScriptedNetwork: RtcNetwork {
 }
 
 final class RecordingAudioControl: RtcAudioControl {
+    /// A call with audio ended moments ago (RtcAudioControl.endedMomentsAgo).
+    var endedMomentsAgo = false
     private(set) var steps: [String] = []
     var directStarts = true
     var restarts = true

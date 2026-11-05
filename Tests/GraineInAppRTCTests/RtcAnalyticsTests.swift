@@ -45,10 +45,8 @@ private let transportRow = GraineCallTelemetry.frame("transport", ["transport": 
         rig.minting.release()                   // minted on the web route: 640 ms
         rig.clock.advance(0.12)
         rig.media.finishOffer()                 // gathered: 120 ms
-        rig.clock.advance(0.18)
-        rig.openSip()                           // registered 300 ms after its socket was asked for
-        rig.clock.advance(0.1)
-        rig.engine.audioActivated()             // the INVITE, 1040 ms after the tap
+        rig.clock.advance(0.28)
+        rig.openSip()                           // the socket open, 400 ms after it was asked for: the INVITE, 1040 ms after the tap
         rig.clock.advance(0.605)
         rig.sbc.releaseFinal()                  // answered 605 ms later
         rig.clock.advance(0.03)
@@ -59,7 +57,7 @@ private let transportRow = GraineCallTelemetry.frame("transport", ["transport": 
         join(rig)
         #expect(control.sent == [
             transportRow,
-            #"{"type":"app_event","event":{"name":"connect","detail":"cold · 1.6s (setup 1.0s, answer 0.6s)","quiet":true,"telemetry":true,"data":{"mode":"cold","warm":false,"total_ms":1645,"setup_ms":1040,"dial_ms":605,"mint_ms":640,"mint_route":"web","gather_ms":120,"register_ms":300,"redials":0,"ice_ms":30}}}"#,
+            #"{"type":"app_event","event":{"name":"connect","detail":"cold · 1.6s (setup 1.0s, answer 0.6s)","quiet":true,"telemetry":true,"data":{"mode":"cold","warm":false,"total_ms":1645,"setup_ms":1040,"dial_ms":605,"mint_ms":640,"mint_route":"web","gather_ms":120,"register_ms":400,"redials":0,"ice_ms":30}}}"#,
         ], "the transport row its dialler wrote, then the connect row: total = setup + dial")
     }
 
@@ -82,10 +80,9 @@ private let transportRow = GraineCallTelemetry.frame("transport", ["transport": 
         #expect(rig.names == ["ready"])
         rig.engine.preparedAhead = true
         rig.engine.transportRow = transportRow
-        d.clock.advance(73.482)
-        rig.engine.begin()                      // the tap, 74.6 s after the preparation began
-        d.clock.advance(0.096)
-        rig.engine.audioActivated()             // the INVITE: 96 ms of setup
+        d.clock.advance(73.578)
+        rig.engine.tapAgoSeconds = 0.096
+        rig.engine.begin()                      // the tap, 74.6 s after the preparation began, reached the call 96 ms later: the INVITE
         d.clock.advance(0.716)
         rig.sbc.releaseFinal()                  // answered: 716 ms
         d.clock.advance(0.038)
@@ -177,12 +174,13 @@ private let transportRow = GraineCallTelemetry.frame("transport", ["transport": 
 
     @Test func aSipSocketReplacedBeforeTheDialWaitsForTheChannel() throws {
         let rig = EngineRig()
-        rig.ready()
+        rig.engine.prepare()
+        rig.openSip()
         rig.sockets.sip.last?.serverClose(1006, "gone")
         rig.clock.advance(0.25)
         rig.openSip()                              // a fresh connection, registered
+        rig.engine.begin()
         #expect(rows(rig).isEmpty, "queued: the channel has not joined")
-        rig.engine.audioActivated()
         rig.media.ice(.connected)
         join(rig)
         #expect(rows(rig).map(\.name) == ["recovery", "connect"], "kept in order until it joined")

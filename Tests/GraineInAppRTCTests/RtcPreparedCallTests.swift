@@ -74,18 +74,19 @@ import Testing
     /// The attempt's twelve seconds start when the call is dialled, however long it waited prepared — its registration kept alive.
     @Test func theAttemptsTwelveSecondsStartAtTheDialNotAtPrepare() {
         let rig = EngineRig()
+        rig.media.offerResult = nil               // the offer never comes: nothing can be dialled
         rig.engine.prepare()
         rig.openSip()
         let registered = rig.sbc.received.filter { $0.method == "REGISTER" }.count
         rig.clock.advance(280)                    // past JsSIP's latest refresh point (150 s + up to 118 s)
-        #expect(rig.names == ["ready"], "prepared for minutes: nothing gives up")
+        #expect(rig.names.isEmpty, "prepared for minutes: nothing gives up")
         #expect(rig.sbc.received.filter { $0.method == "REGISTER" }.count > registered, "the registration refreshed meanwhile")
         #expect(rig.sockets.control.first?.closedByClient != true && rig.sockets.control.isEmpty, "and no conversation opened")
         rig.engine.begin()
         rig.clock.advance(11.9)
-        #expect(rig.names == ["ready"])
+        #expect(rig.names.isEmpty)
         rig.clock.advance(0.2)
-        #expect(rig.names == ["ready", "unreachable(error)"], "twelve seconds from the dial")
+        #expect(rig.names == ["unreachable(error)"], "twelve seconds from the dial")
     }
 
     /**
@@ -110,13 +111,12 @@ import Testing
             if SipParser.parse(text)?.method == "INVITE" { audioAtInvite.append(rig.audio.steps) }
             server?(text)
         }
-        rig.engine.begin()                        // the tap
+        rig.engine.begin()                        // the tap: the dial
         rig.clock.advance(1)
-        #expect(rig.audio.steps == ["begins"], "the tap alone does not either: the call's audio is CallKit's to hand over")
-        #expect(rig.invites.isEmpty)
-        rig.engine.audioActivated()               // CallKit's didActivate: the dial
+        #expect(rig.audio.steps == ["begins"], "the tap and the dial do not either: the call's audio is CallKit's to hand over")
+        #expect(!audioAtInvite.isEmpty && audioAtInvite.allSatisfy { $0 == ["begins"] }, "the INVITE turns nothing on")
+        rig.engine.audioActivated()               // CallKit's didActivate
         #expect(rig.audio.steps == ["begins", "activated"])
-        #expect(!audioAtInvite.isEmpty && audioAtInvite.allSatisfy { $0 == ["begins", "activated"] }, "enabled first, then the INVITE")
 
         let released = EngineRig()
         released.engine.prepare()

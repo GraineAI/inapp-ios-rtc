@@ -364,14 +364,17 @@ private func unheard(_ rig: EngineRig) -> [String] {
     }
 
     @Test func theAudioIsSaidReadyOnlyOnceItHasPlayedSteadily() {
-        let rig = EngineRig()
+        let rig = EngineRig(startReadings: true)
         rig.live()
         join(rig)
+        let step = RtcCallEngine.startLevelSeconds
         rig.media.level.samplesReceived = 0
-        readings(rig, for: 0.2, samples: 0, packets: 10)       // the first reading: the baseline
-        readings(rig, for: 0.2, samples: 1_600, packets: 10)   // playing for one reading…
+        rig.clock.advance(step)                                // the first reading: the baseline
+        rig.media.level.samplesReceived = 480
+        rig.clock.advance(step)                                // playing for one reading…
         #expect(readySent(rig) == 0, "one reading of playout is not yet steady: the greeting would go into audio that may be cut")
-        readings(rig, for: 0.2, samples: 1_600, packets: 10)   // …and still playing, \(RtcCallEngine.readyStableSeconds) s on
+        rig.media.level.samplesReceived = 960
+        rig.clock.advance(step)                                // …and still playing: under a fifth of a second for a tapped call
         #expect(readySent(rig) == 1)
         #expect(events(rig) == ["ready"] && audioRows(rig).first?["reason"] == nil, "a first ready gives no reason")
     }
@@ -380,6 +383,7 @@ private func unheard(_ rig: EngineRig) -> [String] {
         // A redial within a second of the last call: CallKit's late deactivation of the call before lands on this one
         // just after its audio started. The greeting must not start into audio about to be cut.
         let rig = EngineRig()
+        rig.audio.endedMomentsAgo = true
         rig.live()
         join(rig)
         rig.media.level.samplesReceived = 0

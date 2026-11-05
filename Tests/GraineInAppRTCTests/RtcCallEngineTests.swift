@@ -19,6 +19,8 @@ final class EngineRig {
     let minting = ScriptedMinting()
     let audio = RecordingAudioControl()
     let network = ScriptedNetwork()
+    /// Its own, never the app's: tests run side by side.
+    let dialMemory = RtcDialMemory()
     private(set) var events: [GraineRtcEvent] = []
     private(set) var mintSessionIds: [String] = []
     let engine: RtcCallEngine
@@ -29,6 +31,9 @@ final class EngineRig {
         clock: ManualRtcClock = ManualRtcClock(),
         direct: RtcDirectMint? = nil,
         rang: Bool = false,
+        answering: Bool = false,
+        // Off: a reading every 0.2 s from the start, so a test can say what each reading holds.
+        startReadings: Bool = false,
         body: @escaping (String) -> Data = { id in Data(#"{"publishableKey":"pk_test_rig","session_id":"\#(id)"}"#.utf8) }
     ) {
         self.clock = clock
@@ -40,7 +45,9 @@ final class EngineRig {
             makeMedia: { [media] _ in media },
             audio: audio,
             direct: direct,
-            network: network
+            network: network,
+            startReadingEvery: startReadings ? RtcCallEngine.startLevelSeconds : RtcCallEngine.levelSeconds,
+            dialMemory: dialMemory
         )
         var ids: [String] = []
         let request = GraineRtcRequest(
@@ -55,7 +62,9 @@ final class EngineRig {
             debug: true,
             rang: rang
         )
-        engine = RtcCallEngine(request: request, parts: parts)
+        var asked = request
+        asked.answering = answering
+        engine = RtcCallEngine(request: asked, parts: parts)
         let sbc = self.sbc
         sockets.onOpen = { socket in if socket.protocols == ["sip"] { sbc.attach(socket) } }
         engine.onEvent = { [weak self] event in self?.events.append(event) }
@@ -146,9 +155,8 @@ final class EngineRig {
         #expect(rig.sbc.received.filter { $0.method == "REGISTER" }.count == 2, "challenged, then authorised")
         rig.engine.begin()
         #expect(rig.sockets.control.first?.url.absoluteString == "wss://ws.graine.ai/control/v1/\(rig.engine.sessionId)")
-        #expect(rig.invites.isEmpty, "no INVITE before CallKit hands the audio over")
-        rig.engine.audioActivated()
-        try #require(rig.invites.count == 2, "challenged, then authorised")
+        try #require(rig.invites.count == 2, "challenged, then authorised: at the tap, the greeting waits for the phone's word")
+        #expect(rig.audio.steps == ["begins"], "and the audio is still CallKit's to hand over")
         let invite = rig.invites[1]
         #expect(invite.requestUri == "sip:app-\(MintFixture.credential.applicationSid)@\(MintFixture.credential.realm)")
         #expect(invite.header("X-Graine-Session-Id") == rig.engine.sessionId)
@@ -159,6 +167,7 @@ final class EngineRig {
         rig.media.ice(.checking)
         rig.media.ice(.connected)
         #expect(rig.names == ["ready", "connected"])
+        rig.engine.audioActivated()
         #expect(rig.audio.steps == ["begins", "activated"])
     }
 
@@ -223,7 +232,20 @@ final class EngineRig {
         refused.ready()
         #expect(refused.names == ["unreachable(register_failed)"])
 
+        // Prepared, with no dial out to decide: the registration's own deadline.
+        let prepared = EngineRig()
+        prepared.sbc.challenge = false
+        prepared.sbc.registerReply = nil
+        prepared.engine.prepare()
+        prepared.openSip()
+        prepared.clock.advance(DialRules.registerDeadline - 0.1)
+        #expect(prepared.names.isEmpty)
+        prepared.clock.advance(0.2)
+        #expect(prepared.names == ["unreachable(register_failed)"])
+
+        // An app that registers first: the attempt's budget names the stage it stopped at.
         let silent = EngineRig()
+        silent.dialMemory.registrationFirst = true
         silent.sbc.challenge = false
         silent.sbc.registerReply = nil
         silent.ready()
@@ -527,31 +549,32 @@ final class EngineRig {
     @Test func theWholeAttemptHas12SecondsFromTheMintsAnswer() {
         let rig = EngineRig()
         rig.minting.hold = true
+        rig.media.offerResult = nil             // the offer never comes: nothing can be dialled
         rig.ready()
         rig.clock.advance(20)
         #expect(rig.names.isEmpty, "the mint still on its way: no budget spent yet")
         rig.minting.release()
         rig.openSip()
-        #expect(rig.names == ["ready"])
         rig.clock.advance(11.9)
-        #expect(rig.names == ["ready"], "CallKit has not handed the audio over: nothing dialled, the budget still running")
+        #expect(rig.names.isEmpty, "nothing dialled, the budget still running")
         rig.clock.advance(0.2)
-        #expect(rig.names == ["ready", "unreachable(error)"], "12 s after the mint answered, not 12 s after the tap")
+        #expect(rig.names == ["unreachable(error)"], "12 s after the mint answered, not 12 s after the tap")
     }
 
     @Test func aCallPreparedBeforeTheTapHasItsBudgetFromTheTap() {
         let rig = EngineRig()
+        rig.media.offerResult = nil             // the offer never comes: nothing can be dialled
         rig.engine.prepare()
         rig.openSip()
-        rig.clock.advance(30)                   // minted and ready long before the tap
+        rig.clock.advance(30)                   // minted long before the tap
         rig.engine.begin()
         rig.clock.advance(11.9)
-        #expect(rig.names == ["ready"])
+        #expect(rig.names.isEmpty)
         rig.clock.advance(0.2)
-        #expect(rig.names == ["ready", "unreachable(error)"])
+        #expect(rig.names == ["unreachable(error)"])
     }
 
-    @Test func withoutCallKitTheAudioIsStartedDirectlyThenTheCallDials() {
+    @Test func withoutCallKitTheAudioIsStartedDirectly() {
         let rig = EngineRig()
         rig.ready()
         var started: Bool?
@@ -564,7 +587,7 @@ final class EngineRig {
         failing.ready()
         failing.engine.startAudioDirectly { started = $0 }
         #expect(started == false)
-        #expect(failing.invites.isEmpty)
+        #expect(failing.audio.steps == ["begins", "direct"], "and the call's audio watch decides what comes of it")
     }
 
     @Test func aLostPathIsRestartedOnceThenDropped() throws {
@@ -792,11 +815,12 @@ final class EngineRig {
 
     @Test func aSocketLostBeforeTheDialIsReplacedOnce() {
         let rig = EngineRig()
-        rig.ready()
+        rig.engine.prepare()
+        rig.openSip()
         rig.sockets.sip.last?.serverClose(1006, "gone")
         #expect(rig.sockets.sip.count == 2)
         rig.openSip()
-        rig.engine.audioActivated()
+        rig.engine.begin()
         #expect(rig.invites.count == 2, "dialled on the new one")
         rig.sockets.sip.last?.serverClose(1006, "gone")
         #expect(rig.names.last != "ended(dropped)")

@@ -151,10 +151,16 @@ protocol RtcAudioControl: AnyObject {
     func watchRoute(_ heard: @escaping (RtcAudioRouteEvent) -> Void) -> () -> Void
     /// The call is over: the app's own audio settings back.
     func callEnds()
+    /**
+     * A call that had its audio ended moments ago: CallKit's deactivation for it may still land on the audio just
+     * started, so the audio is watched a little longer before it is said ready.
+     */
+    var endedMomentsAgo: Bool { get }
 }
 
 /// The Mac's (and the tests'): there is no audio session to manage.
 final class NoAudioControl: RtcAudioControl {
+    var endedMomentsAgo: Bool { false }
     func callBegins() {}
     func activated() {}
     func startDirectly() -> Bool { true }
