@@ -121,6 +121,14 @@ protocol RtcMedia: AnyObject {
  * while it rings never touches the microphone, and the greeting is never
  * played into an audio session that is not running yet. Nothing on a Mac.
  */
+/// THE AGENT'S FACE (GraineInApp Core/AvatarFace.swift): the call's own copy of the agent's voice, silenced while the face carries it.
+protocol RtcAgentVoice: AnyObject {
+    /// Heard (true) or silenced (false): the received track's volume only — the receiver, its statistics' packets and every watch keep running.
+    func setAgentAudible(_ audible: Bool)
+    /// The agent's voice on the meter scale (0–1), measured before that volume; nil when not measured. Any thread.
+    var agentLevelBeforeMute: Double? { get }
+}
+
 protocol RtcAudioControl: AnyObject {
     /// A WebRTC call begins: manual audio, disabled.
     func callBegins()

@@ -76,6 +76,8 @@ final class RtcCallEngine: GraineRtcCall {
         var startReadingEvery: Double = RtcCallEngine.startLevelSeconds
         /// What this app learned about dialling ahead of the registration.
         var dialMemory: RtcDialMemory = .shared
+        /// A viewer for the agent's face on this app's WebRTC (Engine/WebRTCAvatarViewer.swift); nil: none.
+        var makeAvatarViewer: () -> GraineAvatarViewer? = { nil }
 
         static func production() -> Parts {
             #if os(iOS)
@@ -91,7 +93,8 @@ final class RtcCallEngine: GraineRtcCall {
                 makeMedia: { WebRTCMedia(clock: $0) },
                 audio: audio,
                 direct: RtcDirectMint.shared,
-                network: PathRtcNetwork()
+                network: PathRtcNetwork(),
+                makeAvatarViewer: { WebRTCAvatarViewer() }
             )
         }
     }
@@ -194,6 +197,11 @@ final class RtcCallEngine: GraineRtcCall {
     private var begun = false
     private var audioOn = false
     private var muted = false
+    /// The call's own copy of the agent's voice is heard (the agent's face silences it while it carries the voice).
+    private var agentAudible = true
+    /// The media's agent voice, for its level from any thread.
+    private let agentVoiceLock = NSLock()
+    private weak var agentVoice: RtcAgentVoice?
     private var dials = 0
     private var dialSeq = 0
     /// The INVITE in flight has had a reply: a provisional one, or its answer. A challenge is not one — it replaces the INVITE.
@@ -470,6 +478,24 @@ final class RtcCallEngine: GraineRtcCall {
         }
     }
 
+    // MARK: - The agent's face (GraineInApp Core/AvatarFace.swift)
+
+    func makeAvatarViewer() -> GraineAvatarViewer? { parts.makeAvatarViewer() }
+
+    func setAgentAudible(_ audible: Bool) {
+        clock.run { [self] in
+            agentAudible = audible
+            (media as? RtcAgentVoice)?.setAgentAudible(audible)
+        }
+    }
+
+    var agentLevelBeforeMute: Double? {
+        agentVoiceLock.lock()
+        let voice = agentVoice
+        agentVoiceLock.unlock()
+        return voice?.agentLevelBeforeMute
+    }
+
     func sendControl(_ frame: String, kind: String?) {
         clock.run { [self] in control?.send(frame, kind: kind) }
     }
@@ -629,6 +655,12 @@ final class RtcCallEngine: GraineRtcCall {
         let made = parts.makeMedia(clock)
         media = made
         made.setMuted(muted)
+        if let voice = made as? RtcAgentVoice {
+            voice.setAgentAudible(agentAudible)
+            agentVoiceLock.lock()
+            agentVoice = voice
+            agentVoiceLock.unlock()
+        }
         made.onIceState = { [weak self] state in self?.clock.run { self?.iceChanged(state) } }
         made.prepareOffer(iceServers: credential.iceServers) { [weak self] result in
             self?.clock.run { self?.offerMade(result) }

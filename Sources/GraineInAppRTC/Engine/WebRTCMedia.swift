@@ -21,7 +21,7 @@ import LiveKitWebRTC
  * WebRTC's callbacks arrive on its own threads; every result hops onto the
  * engine's clock before anything is decided.
  */
-final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
+final class WebRTCMedia: NSObject, RtcMedia, RtcAgentVoice, LKRTCPeerConnectionDelegate {
     /// How the process's one factory is built. Set before the first call; the Mac's live test renders without a speaker.
     struct FactoryOptions {
         /// The library's AVAudioEngine device module instead of the platform's.
@@ -44,7 +44,9 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
             audioDeviceModuleType: factoryOptions.audioEngine ? .audioEngine : .platformDefault,
             bypassVoiceProcessing: false,
             encoderFactory: nil,
-            decoderFactory: nil,
+            // Video decoders for the agent's face (WebRTCAvatarViewer), which shares this factory and its audio;
+            // the call itself is audio only and never offers video.
+            decoderFactory: LKRTCDefaultVideoDecoderFactory(),
             audioProcessingModule: nil
         )
         if factoryOptions.audioEngine && factoryOptions.manualRendering {
@@ -67,6 +69,11 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
     private var gathering: Gathering?
     /// Muted before the track existed: applied when it does.
     private var muted = false
+    /// The agent's voice as received, its level read before its volume (the agent's face silences it).
+    private var remoteAudio: LKRTCAudioTrack?
+    private let agentMeter = AudioLevelMeter()
+    private let agentLock = NSLock()
+    private var agentAudible = true
 
     /// The rule's state while an offer gathers.
     private struct Gathering {
@@ -110,9 +117,17 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
         let initial = LKRTCRtpTransceiverInit()
         initial.direction = .sendRecv
         initial.streamIds = ["graine-call"]
-        guard peer.addTransceiver(with: track, init: initial) != nil else {
+        guard let transceiver = peer.addTransceiver(with: track, init: initial) else {
             done(.failure(RtcMediaError(description: "the audio transceiver could not be added")))
             return
+        }
+        if let received = transceiver.receiver.track as? LKRTCAudioTrack {
+            received.add(agentMeter)
+            agentLock.lock()
+            remoteAudio = received
+            let audible = agentAudible
+            agentLock.unlock()
+            received.source.volume = audible ? 1 : 0
         }
         offer(iceRestart: false, gather: true, done: done)
     }
@@ -179,7 +194,9 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
                 guard (stat.values["kind"] as? String ?? stat.values["mediaType"] as? String) == "audio" else { continue }
                 func number(_ key: String) -> Double { (stat.values[key] as? NSNumber)?.doubleValue ?? 0 }
                 found = RtcInboundAudio(
-                    audioLevel: number("audioLevel"),
+                    // While the agent's face carries the voice this track is silenced, and its own level reads that
+                    // silence: the level before it is the agent's, for speaking, the visualiser and the first words.
+                    audioLevel: self.agentSilenced ? self.agentMeter.peakLevel() : number("audioLevel"),
                     totalAudioEnergy: number("totalAudioEnergy"),
                     bytesReceived: Int(number("bytesReceived")),
                     packetsReceived: Int(number("packetsReceived")),
@@ -263,10 +280,38 @@ final class WebRTCMedia: NSObject, RtcMedia, LKRTCPeerConnectionDelegate {
         return true
     }
 
+    // MARK: - RtcAgentVoice
+
+    func setAgentAudible(_ audible: Bool) {
+        agentLock.lock()
+        agentAudible = audible
+        let track = remoteAudio
+        agentLock.unlock()
+        track?.source.volume = audible ? 1 : 0
+    }
+
+    var agentLevelBeforeMute: Double? {
+        agentLock.lock()
+        let measured = remoteAudio != nil
+        agentLock.unlock()
+        return measured ? agentMeter.meterLevel() : nil
+    }
+
+    private var agentSilenced: Bool {
+        agentLock.lock()
+        defer { agentLock.unlock() }
+        return !agentAudible
+    }
+
     func close() {
         gathering?.timer?.cancel()
         gathering = nil
         onIceState = nil
+        agentLock.lock()
+        let received = remoteAudio
+        remoteAudio = nil
+        agentLock.unlock()
+        received?.remove(agentMeter)
         peer?.close()
         peer = nil
         track = nil
