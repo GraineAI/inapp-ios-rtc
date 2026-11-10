@@ -73,13 +73,56 @@ final class RtcAudioGate: RtcAudioControl {
 
     private var session: LKRTCAudioSession { LKRTCAudioSession.sharedInstance() }
 
+    /// WebRTC's own configuration as it was before the first leg took the gate: given back when the last leg lets go.
+    private var savedConfiguration: LKRTCAudioSessionConfiguration?
+
     private init() {
         session.add(reports)
+    }
+
+    /**
+     * WEBRTC IS TOLD WHAT A CALL'S AUDIO IS, BEFORE EVERY LEG. This WebRTC
+     * build fixes the configuration it applies to every call
+     * (`configureWebRTCSession`, each time its audio unit is set up) ONCE PER
+     * LAUNCH OF THE APP, from the app's audio session as it is when WebRTC
+     * first reads it: RTCAudioSessionConfiguration's init copies the session's
+     * category and mode. Read before anything set a call's mode — a booked
+     * call ringing an app that was closed, a tap a moment after launch — that
+     * is solo ambient, and WebRTC then puts every call's session back to it:
+     * the call's settings are refused (-50), the audio unit never starts, the
+     * call ends with no sound, and so does every call until the app is
+     * started again (10 Nov 2026, iPhone: the session set to
+     * "SoloAmbientSound / Default" half a second after the call's audio came
+     * on). So the call's own — play and record, voice chat, Bluetooth headsets,
+     * as `configure` sets it — is WebRTC's from the first leg on, and an app
+     * that uses the same library for something else gets its own back when the
+     * last leg ends.
+     */
+    private func pinCallConfiguration() {
+        let call = LKRTCAudioSessionConfiguration.webRTC()
+        guard call.category != AVAudioSession.Category.playAndRecord.rawValue
+            || call.mode != AVAudioSession.Mode.voiceChat.rawValue
+            || !call.categoryOptions.contains(Self.bluetooth) else { return }
+        let pinned = LKRTCAudioSessionConfiguration()
+        pinned.category = AVAudioSession.Category.playAndRecord.rawValue
+        pinned.mode = AVAudioSession.Mode.voiceChat.rawValue
+        pinned.categoryOptions = [Self.bluetooth]
+        pinned.sampleRate = call.sampleRate
+        pinned.ioBufferDuration = call.ioBufferDuration
+        pinned.inputNumberOfChannels = call.inputNumberOfChannels
+        pinned.outputNumberOfChannels = call.outputNumberOfChannels
+        LKRTCAudioSessionConfiguration.setWebRTC(pinned)
+        Self.note("WebRTC's call audio was \(call.category) / \(call.mode): set to play and record, voice chat.")
     }
 
     func callBegins() {
         lock.lock()
         defer { lock.unlock() }
+        if holders == 0 {
+            savedConfiguration = LKRTCAudioSessionConfiguration.webRTC()
+        }
+        // Before this leg makes anything: what WebRTC applies to the call is the call's.
+        pinCallConfiguration()
         if holders == 0 {
             saved = (session.useManualAudio, session.isAudioEnabled)
             // No call holds the gate, yet WebRTC still believes a session active: the last call's, its deactivation never
@@ -104,6 +147,7 @@ final class RtcAudioGate: RtcAudioControl {
 
     func activated() {
         noteAudio()
+        pinCallConfiguration()
         session.audioSessionDidActivate(AVAudioSession.sharedInstance())
         configure()
         enable()
@@ -177,6 +221,7 @@ final class RtcAudioGate: RtcAudioControl {
     /// The session activated here, on AVAudioSession itself, and WebRTC told as CallKit's activation tells it; its audio enabled afresh.
     private func activateHere() -> Bool {
         noteAudio()
+        pinCallConfiguration()
         let audio = AVAudioSession.sharedInstance()
         session.lockForConfiguration()
         do {
@@ -229,6 +274,9 @@ final class RtcAudioGate: RtcAudioControl {
             session.isAudioEnabled = saved.enabled
         }
         saved = nil
+        // The app's own WebRTC configuration back: the next leg pins the call's again before it makes anything.
+        if let configuration = savedConfiguration { LKRTCAudioSessionConfiguration.setWebRTC(configuration) }
+        savedConfiguration = nil
     }
 
     /// The session the rescue activated, deactivated: CallKit, which never activated it, will not — and hands no next call a session the app holds.
