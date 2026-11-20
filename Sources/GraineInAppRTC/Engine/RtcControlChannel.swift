@@ -1,3 +1,4 @@
+@_spi(GraineRTC) import GraineInApp
 import Foundation
 
 /*
@@ -42,17 +43,33 @@ final class RtcControlChannel {
     /// How many times it has been opened — for the tests and the log.
     private(set) var opens = 0
 
-    init(host: String, sessionId: String, clock: RtcClock, sockets: RtcSocketFactory, log: @escaping (String) -> Void = { _ in }) {
-        var base = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        while base.hasSuffix("/") { base.removeLast() }
-        let id = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
-        self.url = URL(string: base + "/control/v1/" + id) ?? URL(string: "wss://ws.graine.ai/control/v1/" + id)!
+    /// Nil when there is no address to open it on (`address(host:sessionId:baseUrl:)`): an install's session named no host.
+    init?(host: String, sessionId: String, baseUrl: String, clock: RtcClock, sockets: RtcSocketFactory, log: @escaping (String) -> Void = { _ in }) {
+        guard let url = Self.address(host: host, sessionId: sessionId, baseUrl: baseUrl) else { return nil }
+        self.url = url
         self.clock = clock
         self.sockets = sockets
         self.log = log
     }
 
     var address: URL { url }
+
+    /**
+     * `{host}/control/v1/{sessionId}`. On Graine's own platform (`baseUrl`),
+     * exactly as always: a host that does not make an address is Graine's own
+     * channel. For an install, only a `ws://` or `wss://` address with a host:
+     * nil otherwise — an install's call never opens a channel on Graine's host.
+     */
+    static func address(host: String, sessionId: String, baseUrl: String) -> URL? {
+        var base = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        while base.hasSuffix("/") { base.removeLast() }
+        let id = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
+        guard GraineRtcHosts.isGraineCloud(baseUrl) else {
+            guard GraineRtcHosts.isSocketAddress(base), let url = URL(string: base + "/control/v1/" + id) else { return nil }
+            return url
+        }
+        return URL(string: base + "/control/v1/" + id) ?? URL(string: "wss://ws.graine.ai/control/v1/" + id)!
+    }
 
     /// Open it (again). Safe to call twice.
     func open() {

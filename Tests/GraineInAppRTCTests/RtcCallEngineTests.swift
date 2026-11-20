@@ -34,6 +34,9 @@ final class EngineRig {
         answering: Bool = false,
         // Off: a reading every 0.2 s from the start, so a test can say what each reading holds.
         startReadings: Bool = false,
+        // Graine's own platform and its socket host, unless a test is an install's.
+        baseUrl: String = "https://www.graine.ai/",
+        controlHost: String = "wss://ws.graine.ai",
         body: @escaping (String) -> Data = { id in Data(#"{"publishableKey":"pk_test_rig","session_id":"\#(id)"}"#.utf8) }
     ) {
         self.clock = clock
@@ -51,8 +54,8 @@ final class EngineRig {
         )
         var ids: [String] = []
         let request = GraineRtcRequest(
-            baseUrl: "https://www.graine.ai/",
-            controlHost: "wss://ws.graine.ai",
+            baseUrl: baseUrl,
+            controlHost: controlHost,
             mintBody: { id in
                 ids.append(id)
                 return body(id)
@@ -833,5 +836,28 @@ final class EngineRig {
         #expect(rig.media.muted.first == true, "a mute from before the peer existed")
         rig.engine.setMuted(false)
         #expect(rig.media.muted.last == false)
+    }
+}
+
+/// An app on its own Graine install (docs: "Use your own Graine install"): the call's control channel is the install's, or there is none.
+@Suite struct RtcOwnInstallTests {
+    @Test func anInstallCallWithNoControlHostGivesUpBeforeAnythingIsMintedOrOpened() {
+        let rig = EngineRig(baseUrl: "https://agents.example.com", controlHost: "")
+        rig.engine.prepare()
+        rig.engine.begin()
+        #expect(rig.names == ["unreachable(error)"], "to the WebSocket, as any failure before media")
+        #expect(rig.sockets.sockets.isEmpty, "no control channel and no SIP socket: not on Graine's host, not anywhere")
+        #expect(rig.minting.requests.isEmpty, "nothing minted")
+        #expect(rig.audio.steps.isEmpty, "the audio untouched")
+    }
+
+    @Test func anInstallCallsChannelIsTheInstallsOwn() {
+        let rig = EngineRig(baseUrl: "https://agents.example.com", controlHost: "wss://api.agents.example.com")
+        rig.ready()
+        let control = rig.sockets.sockets.filter { $0.protocols.isEmpty }
+        #expect(control.count == 1)
+        #expect(control.first?.url.host == "api.agents.example.com")
+        #expect(rig.minting.requests.first?.url.absoluteString == "https://agents.example.com/api/embed/rtc-session")
+        #expect(!rig.names.contains("unreachable(error)"))
     }
 }

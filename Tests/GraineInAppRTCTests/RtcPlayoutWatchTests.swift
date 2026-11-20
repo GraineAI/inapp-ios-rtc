@@ -134,6 +134,45 @@ private func unheard(_ rig: EngineRig) -> [String] {
         #expect(!rig.audio.steps.contains("restart") && unheard(rig).isEmpty)
     }
 
+    // A REJOIN may take the audio-ready frame with it — written just before the server's close and never read — and
+    // the agent's greeting waits for it. While the agent is unheard, the rejoined channel is told again; once it was
+    // heard, nothing more.
+    @Test func aRejoinedChannelIsToldReadyAgainWhileTheAgentIsUnheard() throws {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.level.samplesReceived = 0
+        rig.media.level.audioLevel = 0
+        join(rig)
+        readings(rig, for: 1, samples: 1_600, packets: 10)
+        let first = try #require(rig.sockets.control.first)
+        #expect(first.sent.filter { $0 == GraineRtcSignal.audioReady }.count == 1)
+        first.serverClose(1008, "too many control frames")
+        rig.clock.advance(RtcControlChannel.reopenSeconds)
+        #expect(rig.sockets.control.count == 2, "opened again")
+        join(rig)
+        let second = try #require(rig.sockets.control.last)
+        #expect(second.sent.filter { $0 == GraineRtcSignal.audioReady }.count == 1, "said again: the welcome waits for it")
+        readings(rig, for: 1, samples: 1_600, packets: 10)
+        #expect(second.sent.filter { $0 == GraineRtcSignal.audioReady }.count == 1, "once on the new channel")
+    }
+
+    @Test func aRejoinAfterTheAgentWasHeardSaysNothingAgain() throws {
+        let rig = EngineRig()
+        rig.live()
+        rig.media.level.samplesReceived = 0
+        rig.media.level.audioLevel = 0
+        join(rig)
+        readings(rig, for: 1, samples: 1_600, packets: 10)
+        rig.media.level.audioLevel = RtcCallEngine.speakingLevel + 0.1
+        readings(rig, for: 0.4, samples: 1_600, packets: 10)
+        let first = try #require(rig.sockets.control.first)
+        first.serverClose(1006, "gone")
+        rig.clock.advance(RtcControlChannel.reopenSeconds)
+        join(rig)
+        let second = try #require(rig.sockets.control.last)
+        #expect(!second.sent.contains(GraineRtcSignal.audioReady), "the agent was heard: nothing to release")
+    }
+
     @Test func libwebrtcsOwnPlayoutCountSaysReadyBeforeAnyPacket() throws {
         let rig = EngineRig()
         rig.live()

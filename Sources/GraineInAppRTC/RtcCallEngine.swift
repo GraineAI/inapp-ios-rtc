@@ -253,6 +253,8 @@ final class RtcCallEngine: GraineRtcCall {
     private var stillFor = 0.0
     private var playoutRestartedAt: Double?
     private var audioReady = false
+    /// How many times the control channel has joined its call (control_ready): the first join, then each rejoin.
+    private var controlJoins = 0
     private var playoutFailed = false
     /// How often WebRTC's audio unit has been asked again, and when last.
     private var unitRetries = 0
@@ -369,16 +371,23 @@ final class RtcCallEngine: GraineRtcCall {
     func prepare() {
         clock.run { [self] in
             guard phase == .idle else { return }
+            // An install whose session named no conversation host: no channel to open, and never Graine's —
+            // before anything is minted or touched, the call goes to the WebSocket, as any failure before media.
+            guard let channel = RtcControlChannel(host: request.controlHost, sessionId: sessionId, baseUrl: request.baseUrl, clock: clock,
+                                                  sockets: parts.sockets, log: { [weak self] in self?.trace($0) }) else {
+                giveUp(.error, GraineRtcHosts.noSocketHost)
+                return
+            }
             phase = .preparing
             startedAt = clock.now
             // Nothing touches the microphone until CallKit hands the audio over.
             parts.audio.callBegins()
             audioTaken = true
-            let channel = RtcControlChannel(host: request.controlHost, sessionId: sessionId, clock: clock, sockets: parts.sockets, log: { [weak self] in self?.trace($0) })
             channel.onFrame = { [weak self] text in self?.emit(.control(text)) }
             channel.onJoined = { [weak self] joined in
                 self?.mark(joined ? "control_ready" : "control_lost")
                 self?.trace(joined ? "control: joined" : "control: lost")
+                if joined { self?.controlJoined() }
             }
             control = channel
             // The network, for the recovery's rules: changes hop onto the clock.
@@ -407,6 +416,22 @@ final class RtcCallEngine: GraineRtcCall {
         guard begun, budgetTimer == nil, phase < .live else { return }
         budgetArmedAt = clock.now
         budgetTimer = clock.after(request.budgetSeconds) { [weak self] in self?.budgetSpent() }
+    }
+
+    /**
+     * THE CHANNEL JOINED. A first join needs nothing: what was queued goes (the
+     * channel drains it). A REJOIN — the server closed the socket or the network
+     * dropped it — may have taken the phone's audio-ready frame with it: written
+     * just before the close and never read. While the agent's voice has not been
+     * heard, it is said again: the agent's greeting waits for it (a few seconds at
+     * most), and a second one is harmless there. Once the agent was heard, the
+     * greeting has gone: nothing more is said.
+     */
+    private func controlJoined() {
+        controlJoins += 1
+        guard controlJoins > 1, audioReady, marks["first_voice"] == nil, phase != .ended else { return }
+        control?.send(GraineRtcSignal.audioReady, kind: nil)
+        trace("audio: said ready again on the rejoined channel — the agent's welcome waits for it")
     }
 
     func audioActivated() {

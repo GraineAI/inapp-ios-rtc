@@ -160,7 +160,8 @@ import Testing
     private func channel() -> (RtcControlChannel, ManualRtcClock, MemorySocketFactory, [String]) {
         let clock = ManualRtcClock()
         let sockets = MemorySocketFactory()
-        let control = RtcControlChannel(host: "wss://ws.graine.ai/", sessionId: "0123456789abcdef0123456789abcdef", clock: clock, sockets: sockets)
+        let control = RtcControlChannel(host: "wss://ws.graine.ai/", sessionId: "0123456789abcdef0123456789abcdef", baseUrl: "https://www.graine.ai",
+                                        clock: clock, sockets: sockets)!
         return (control, clock, sockets, [])
     }
 
@@ -169,6 +170,27 @@ import Testing
         control.open()
         #expect(sockets.sockets.first?.url.absoluteString == "wss://ws.graine.ai/control/v1/0123456789abcdef0123456789abcdef")
         #expect(sockets.sockets.first?.protocols == [], "no subprotocol, no ticket")
+    }
+
+    /// An install's channel is on the host its session names, and only there: never Graine's (docs: "Use your own Graine install").
+    @Test func anInstallsChannelIsOnlyWhereItsSessionSays() {
+        let id = "0123456789abcdef0123456789abcdef"
+        let own = "https://agents.example.com"
+        #expect(RtcControlChannel.address(host: "wss://api.agents.example.com/", sessionId: id, baseUrl: own)?.absoluteString ==
+                "wss://api.agents.example.com/control/v1/" + id)
+        for missing in ["", "  ", "api.agents.example.com", "https://api.agents.example.com", "wss://", "not a host"] {
+            #expect(RtcControlChannel.address(host: missing, sessionId: id, baseUrl: own) == nil, "\(missing)")
+            #expect(RtcControlChannel(host: missing, sessionId: id, baseUrl: own, clock: ManualRtcClock(), sockets: MemorySocketFactory()) == nil)
+        }
+        // Graine's own platform, exactly as before: the host as given, else (an address Foundation cannot make) Graine's own.
+        for host in ["wss://ws.graine.ai", "wss://ws.graine.ai/", "", "not a host"] {
+            var base = host
+            while base.hasSuffix("/") { base.removeLast() }
+            let before = URL(string: base + "/control/v1/" + id) ?? URL(string: "wss://ws.graine.ai/control/v1/" + id)!
+            #expect(RtcControlChannel.address(host: host, sessionId: id, baseUrl: "https://www.graine.ai") == before, "\(host)")
+        }
+        #expect(RtcControlChannel.address(host: "wss://ws.graine.ai/", sessionId: id, baseUrl: "https://www.graine.ai")?.absoluteString ==
+                "wss://ws.graine.ai/control/v1/" + id)
     }
 
     @Test func framesWaitForControlReadyThenGoInOrder() {
